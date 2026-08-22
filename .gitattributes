@@ -1,0 +1,8 @@
+# Normalise line endings so diffs are identical on Windows, macOS and the Linux
+# host the engine will eventually run on.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.parquet binary

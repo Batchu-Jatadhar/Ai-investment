@@ -1,0 +1,81 @@
+# Local development environment.
+#
+# Deliberately minimal: PostgreSQL, the backend API and the frontend. No broker
+# connectivity, no message broker, no cache, no orchestrator — architecture
+# v0.3 §27 rejects all of those until a measured need appears.
+#
+#   docker compose -f infra/docker-compose.yml up -d db
+#   docker compose -f infra/docker-compose.yml up --build
+#
+# No credentials are required to run this. The database password below is a
+# local development value only and grants access to nothing else.
+
+name: aitrade
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: aitrade-db
+    environment:
+      POSTGRES_USER: aitrade
+      POSTGRES_PASSWORD: aitrade
+      POSTGRES_DB: aitrade
+      # Deterministic collation so ordering does not vary between machines.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aitrade -d aitrade"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/backend.Dockerfile
+    container_name: aitrade-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      # PAPER is the default and the only value this build accepts besides
+      # backtest. LIVE is blocked in code — see app/config/settings.py.
+      TRADING_MODE: paper
+      DATABASE_URL: postgresql+psycopg://aitrade:aitrade@db:5432/aitrade
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+      API_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    # Migrations run explicitly on start; nothing creates tables at runtime.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/frontend.Dockerfile
+    container_name: aitrade-web
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
