@@ -58,7 +58,7 @@ class TestMigrations:
 
     def test_alembic_revision_is_recorded(self, wired_settings: Settings) -> None:
         result = check_database(wired_settings)
-        assert result.migration_revision == "0001_system_event"
+        assert result.migration_revision == "0002_market_data"  # current head
         assert result.details["migrated"] is True
 
 

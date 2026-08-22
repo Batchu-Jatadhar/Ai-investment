@@ -226,8 +226,8 @@ without it. Traceability is good engineering; it is not a compliance claim.
 
 | Phase | Deliverable |
 |---|---|
-| **0** | **Foundation — repository, config, logging, database, migrations, health, tests, CI, Docker. *(this build)*** |
-| 1 | Market data: auth + arming ritual, WebSocket gateway, tick quality, bar engine, instrument master, universe eligibility, Parquet tick store |
+| 0 | Foundation — repository, config, logging, database, migrations, health, tests, CI, Docker. *(done)* |
+| **1** | **Market data — Zerodha read-only auth, instrument master, WebSocket gateway, tick quality, bar engine, session calendar, explicit universe, persistence, repository. *(this build)*** |
 | 2 | Indicators and deterministic regime engine |
 | 3 | One strategy + backtest with pessimistic fills and the full cost model. **Gate: positive expectancy net of costs out-of-sample** |
 | 4 | Risk engine, position sizing, portfolio |
@@ -240,6 +240,66 @@ without it. Traceability is good engineering; it is not a compliance claim.
 | 11 | Measure and extend |
 
 ---
+
+## 11a. Phase 1 as built — market data
+
+**Read-only.** No order operation exists in the codebase, and no HTTP endpoint
+accepts a write. Both are asserted by tests that scan the source tree and the
+published OpenAPI surface.
+
+### Layering
+
+```
+app/domain/market/          provider-neutral: models, ports, session, quality,
+                            candles, universe     (imports no adapter)
+        ^
+        |  MarketDataProvider · InstrumentSource · MarketDataRepository
+        |
+app/adapters/zerodha/       REST client, binary protocol, streaming provider
+app/adapters/replay/        deterministic offline provider
+app/infrastructure/         SqlMarketDataRepository
+app/services/               InstrumentMaster, MarketDataService
+app/runtime/market_data.py  composition root: aitrade-marketdata
+```
+
+### Decisions taken during implementation
+
+| Decision | Reasoning |
+|---|---|
+| **The official `kiteconnect` package is not used** | Its ticker is built on Twisted, which does not belong inside an asyncio service, and the reconnect/gap semantics this architecture requires are not what it provides. The adapter uses `httpx` for the two REST calls and `websockets` plus an in-house decoder for the documented binary frames. The adapter boundary — the thing the architecture actually mandates — is unchanged. **Worth your explicit sign-off.** |
+| Bars align to the UTC epoch | IST is UTC+05:30 and 30 is a multiple of 1, 5 and 15, so epoch-aligned buckets coincide exactly with IST clock boundaries and with the 09:15 session open. No special-casing needed. |
+| Larger intervals aggregate completed 1m bars | Two independent derivations of the same bar disagree at the edges, and the disagreement only surfaces when a backtest cannot be reproduced. |
+| Only completed candles are persisted | An in-progress bar still changes; storing it invites a later reader to treat it as settled history. |
+| A data gap resets the candle engine and validator | Continuity was broken, so a bar spanning the gap is a fiction and the cumulative-volume baseline is meaningless. |
+| Authentication failure does not retry | Kite tokens expire at 06:00 IST daily and only an interactive login renews them. A retry loop burns rate limit and hides the real problem. |
+| Ticks are stored, with pruning; candles are kept | Retention is a policy, not an accident. |
+| SQLite is a supported local backend | Keeps the suite runnable without Docker. Primary keys use `BigInteger().with_variant(Integer, "sqlite")` because SQLite only autoincrements a column declared exactly `INTEGER PRIMARY KEY`. |
+
+### Protocol facts, taken from the official specification
+
+`wss://ws.kite.trade?api_key&access_token`. Big-endian frames: `int16` packet
+count, then `int16` length + payload per packet. Packet length selects the
+layout — 8 (LTP), 28 (index quote), 32 (index full), 44 (quote), 184 (full:
+quote + timestamps + OI + 5×5 depth). The segment is the low byte of the
+instrument token; segment 9 is an index. Prices divide by 100, except CDS
+(10,000,000) and BCD (10,000). REST uses `Authorization: token key:token` and
+`X-Kite-Version: 3`; 403 with `TokenException` means the session is gone.
+
+### Tables added (migration `0002_market_data`)
+
+`instrument`, `market_tick`, `candle`, `connection_event`, `data_gap`,
+`data_quality_event`. Prices are `Numeric(20,6)`; every timestamp is
+timezone-aware UTC; `candle` is unique on `(instrument_token, interval,
+start_at)` so re-ingestion is idempotent.
+
+### Still deferred
+
+Daily universe *eligibility* filters (ADV, spread, F&O ban list, results-day and
+corporate-action exclusions, ASM/GSM) are specified in §4.4 but not implemented:
+they need liquidity history and an exchange feed this phase does not have. The
+universe today is the configured allow-list, resolved through the instrument
+master. The Parquet tick store is likewise deferred — ticks currently go to
+PostgreSQL with a pruning method available.
 
 ## 12. Rules that bind every phase
 

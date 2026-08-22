@@ -6,6 +6,8 @@ reachable by accident. These tests are the executable form of that rule.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -138,10 +140,85 @@ class TestNoExecutionSurface:
         )
         assert mutating == [], f"no write endpoints are permitted yet: {mutating}"
 
-    def test_only_health_endpoints_are_exposed(self, app: FastAPI) -> None:
-        assert self._published_paths(app) == {"/health", "/health/db"}
+    def test_only_read_only_surfaces_are_exposed(self, app: FastAPI) -> None:
+        """Health plus read-only market-data queries. Nothing else."""
+        assert self._published_paths(app) == {
+            "/health",
+            "/health/db",
+            "/health/market-data",
+            "/market-data/instruments/{exchange}/{tradingsymbol}",
+            "/market-data/instruments/by-token/{instrument_token}",
+            "/market-data/candles/{instrument_token}",
+            "/market-data/candles/{instrument_token}/latest",
+            "/market-data/ticks/{instrument_token}/latest",
+        }
 
     def test_health_reports_live_trading_not_implemented(self, client: TestClient) -> None:
         body = client.get("/health").json()
         assert body["live_trading_implemented"] is False
         assert body["trading_mode"] == "paper"
+
+
+class TestNoOrderCapabilityInSource:
+    """Static guarantee: no order operation exists anywhere in the application.
+
+    Phase 1 is read-only market data. The application must remain incapable of
+    placing, modifying or cancelling an order, and that is cheaper to assert
+    over the source tree than to infer from behaviour.
+    """
+
+    FORBIDDEN_CALLABLES = (
+        "def place_order",
+        "def modify_order",
+        "def cancel_order",
+        "def exit_order",
+        "def execute_trade",
+        "place_order(",
+        "modify_order(",
+        "cancel_order(",
+        ".orders(",
+        "/orders",
+    )
+
+    @staticmethod
+    def _sources() -> list[pathlib.Path]:
+        root = pathlib.Path(__file__).resolve().parents[1] / "app"
+        return sorted(root.rglob("*.py"))
+
+    def test_no_order_operations_anywhere_in_app(self) -> None:
+        offenders: list[str] = []
+        for path in self._sources():
+            text = path.read_text(encoding="utf-8")
+            for needle in self.FORBIDDEN_CALLABLES:
+                if needle in text:
+                    offenders.append(f"{path.name}: {needle}")
+        assert offenders == [], f"order capability must not exist: {offenders}"
+
+    def test_no_write_handlers_exist_in_the_http_layer(self) -> None:
+        """No POST/PUT/PATCH/DELETE handler - so no webhook and no order route."""
+        api = pathlib.Path(__file__).resolve().parents[1] / "app" / "api"
+        offenders: list[str] = []
+        for path in sorted(api.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for verb in (".post(", ".put(", ".patch(", ".delete("):
+                if f"@router{verb}" in text or f"@api_router{verb}" in text:
+                    offenders.append(f"{path.name}: {verb}")
+        assert offenders == []
+
+    def test_no_llm_client_is_wired_in(self) -> None:
+        offenders: list[str] = []
+        for path in self._sources():
+            text = path.read_text(encoding="utf-8").lower()
+            if "import anthropic" in text or "from anthropic" in text:
+                offenders.append(path.name)
+        assert offenders == []
+
+    def test_market_data_domain_does_not_import_a_broker(self) -> None:
+        """The domain depends on ports, never on a vendor adapter."""
+        root = pathlib.Path(__file__).resolve().parents[1] / "app" / "domain"
+        offenders = [
+            path.name
+            for path in sorted(root.rglob("*.py"))
+            if "app.adapters" in path.read_text(encoding="utf-8")
+        ]
+        assert offenders == []

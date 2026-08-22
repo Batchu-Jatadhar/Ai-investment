@@ -52,6 +52,27 @@ class LogFormat(StrEnum):
     CONSOLE = "console"
 
 
+class MarketDataProviderName(StrEnum):
+    """Which market-data provider the runtime should use.
+
+    ``replay`` is deterministic offline data and is never presented as live.
+    ``none`` disables market data entirely, which is what a plain API process
+    wants.
+    """
+
+    ZERODHA = "zerodha"
+    REPLAY = "replay"
+    NONE = "none"
+
+
+class StreamMode(StrEnum):
+    """Streaming subscription mode. FULL adds timestamps, OI and market depth."""
+
+    LTP = "ltp"
+    QUOTE = "quote"
+    FULL = "full"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(_REPO_ROOT / ".env"),
@@ -83,10 +104,34 @@ class Settings(BaseSettings):
     api_port: int = 8000
     api_cors_origins: str = "http://localhost:3000"
 
-    # -- Broker (declared, NOT used in this phase) -------------------------
+    # -- Broker credentials ------------------------------------------------
+    # Used for READ-ONLY market data only. No order endpoint exists.
+    # The application starts and serves without these; it simply has no live feed.
     zerodha_api_key: SecretStr | None = None
     zerodha_api_secret: SecretStr | None = None
     zerodha_access_token: SecretStr | None = None
+    zerodha_api_root: str = "https://api.kite.trade"
+    zerodha_ws_root: str = "wss://ws.kite.trade"
+    zerodha_timeout_seconds: float = 15.0
+
+    # -- Market data -------------------------------------------------------
+    market_data_provider: MarketDataProviderName = MarketDataProviderName.ZERODHA
+    market_data_mode: StreamMode = StreamMode.FULL
+    # Explicit, configurable universe. EXCHANGE:TRADINGSYMBOL, comma separated.
+    # Indices are legitimate data subscriptions but are not directly tradable.
+    market_data_universe: str = "NSE:NIFTY 50,NSE:NIFTY BANK,NSE:RELIANCE,NSE:HDFCBANK,NSE:INFY"
+    market_data_intervals: str = "1m,5m,15m"
+    market_data_persist_ticks: bool = True
+    market_data_tick_stale_seconds: int = 30
+    market_data_stream_stale_seconds: int = 60
+    market_data_flush_seconds: float = 1.0
+    instrument_master_max_age_hours: int = 24
+
+    # WebSocket reconnection. 0 attempts means keep retrying; every attempt and
+    # every resulting data gap is recorded.
+    ws_reconnect_initial_seconds: float = 1.0
+    ws_reconnect_max_seconds: float = 30.0
+    ws_reconnect_max_attempts: int = 0
 
     # -- Compliance profile (declared, NOT used in this phase) -------------
     compliance_algo_id: str | None = None
@@ -109,6 +154,24 @@ class Settings(BaseSettings):
     def is_sqlite(self) -> bool:
         return self.database_url.startswith("sqlite")
 
+    @property
+    def zerodha_configured(self) -> bool:
+        """Enough credentials to attempt an authenticated market-data call."""
+        return self.zerodha_api_key is not None and self.zerodha_access_token is not None
+
+    @property
+    def universe_entries(self) -> tuple[str, ...]:
+        return tuple(item.strip() for item in self.market_data_universe.split(",") if item.strip())
+
+    @property
+    def interval_names(self) -> tuple[str, ...]:
+        return tuple(item.strip() for item in self.market_data_intervals.split(",") if item.strip())
+
+    def zerodha_secret(self, name: str) -> str | None:
+        """Read a broker secret. The only place secrets leave configuration."""
+        value: SecretStr | None = getattr(self, f"zerodha_{name}")
+        return value.get_secret_value() if value is not None else None
+
     def safe_dump(self) -> dict[str, object]:
         """Configuration rendered for logs and the health endpoint.
 
@@ -126,6 +189,10 @@ class Settings(BaseSettings):
             "live_trading_implemented": LIVE_TRADING_IMPLEMENTED,
             "broker_credentials_present": self.zerodha_api_key is not None,
             "compliance_profile_present": self.compliance_algo_id is not None,
+            "market_data_provider": self.market_data_provider.value,
+            "market_data_mode": self.market_data_mode.value,
+            "market_data_universe_size": len(self.universe_entries),
+            "zerodha_configured": self.zerodha_configured,
         }
 
     # ------------------------------------------------------------------ #
@@ -186,6 +253,36 @@ class Settings(BaseSettings):
             raise ConfigurationError(
                 f"DATABASE_URL must be a SQLAlchemy URL, got {self.database_url!r}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_market_data(self) -> Settings:
+        """Fail fast on an unusable market-data configuration.
+
+        A malformed universe entry or interval must not surface as a confusing
+        runtime error hours into a session.
+        """
+        from app.domain.market.universe import UniverseSpecError, parse_universe
+
+        try:
+            parse_universe(self.market_data_universe)
+        except UniverseSpecError as exc:
+            raise ConfigurationError(f"MARKET_DATA_UNIVERSE is invalid: {exc}") from exc
+
+        allowed_intervals = {"1m", "5m", "15m"}
+        unknown = sorted(set(self.interval_names) - allowed_intervals)
+        if unknown:
+            raise ConfigurationError(
+                f"MARKET_DATA_INTERVALS contains unsupported values {unknown}; "
+                f"supported: {sorted(allowed_intervals)}"
+            )
+        if "1m" not in self.interval_names:
+            raise ConfigurationError(
+                "MARKET_DATA_INTERVALS must include 1m: larger intervals are "
+                "aggregated from completed 1-minute bars"
+            )
+        if self.instrument_master_max_age_hours <= 0:
+            raise ConfigurationError("INSTRUMENT_MASTER_MAX_AGE_HOURS must be positive")
         return self
 
 

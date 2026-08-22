@@ -43,7 +43,7 @@ class TestDatabaseHealth:
         body = response.json()
         assert body["status"] == "ok"
         assert body["migrated"] is True
-        assert body["migration_revision"] == "0001_system_event"
+        assert body["migration_revision"] == "0002_market_data"  # current head
         assert body["latency_ms"] is not None
 
     def test_returns_503_when_the_database_is_unreachable(
