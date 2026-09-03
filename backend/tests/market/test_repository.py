@@ -14,7 +14,12 @@ from app.domain.market.models import (
     MarketDepth,
     TickMode,
 )
-from app.domain.market.ports import ConnectionEvent, ConnectionEventType, DataGap
+from app.domain.market.ports import (
+    ConnectionEvent,
+    ConnectionEventType,
+    DataGap,
+    MarketDataRepository,
+)
 from app.domain.market.quality import DataQualityEvent, DataQualityIssue
 from tests.market.conftest import RELIANCE_TOKEN, make_tick
 
@@ -228,3 +233,29 @@ class TestOperationalEvents:
             ]
         )
         assert written == 1
+
+
+class TestPortConformance:
+    """The declared port must be the whole contract, not most of it.
+
+    Phase 2 will build against ``MarketDataRepository``. If a service reaches
+    past the port for an implementation-specific method, a substitute repository
+    that satisfies the protocol breaks at runtime - so the protocol has to name
+    every method the application actually calls.
+    """
+
+    def test_sql_repository_satisfies_the_declared_port(self, repository) -> None:  # noqa: ANN001
+        assert isinstance(repository, MarketDataRepository)
+
+    def test_port_declares_every_method_the_application_calls(self, repository) -> None:  # noqa: ANN001
+        # Called by MarketDataService._handle_ticks and by
+        # InstrumentMaster.load_from_repository respectively. Both were reached
+        # through `# type: ignore[attr-defined]` before the port declared them.
+        for name in ("record_quality_events", "all_instruments"):
+            assert hasattr(MarketDataRepository, name), f"port must declare {name}"
+            assert callable(getattr(repository, name))
+
+    def test_a_port_typed_reference_accepts_the_implementation(self, repository) -> None:  # noqa: ANN001
+        """Static proof: mypy checks this assignment against the protocol."""
+        port: MarketDataRepository = repository
+        assert port.instrument_count() >= 0

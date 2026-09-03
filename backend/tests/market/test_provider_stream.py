@@ -351,3 +351,232 @@ class TestReconnectPolicy:
         policy = ReconnectPolicy(max_attempts=3)
         assert policy.should_retry(2) is True
         assert policy.should_retry(3) is False
+
+
+class TestSessionExpiryDuringStream:
+    """An expired token must terminate the stream, never spin it forever.
+
+    Kite access tokens expire at 06:00 IST daily and only an interactive login
+    renews one. A stream running across that boundary loses its session while
+    connected, and the reconnect loop has to tell that apart from a flaky
+    network - otherwise it retries an unrecoverable state indefinitely.
+    """
+
+    @staticmethod
+    def _profile_then_expire(ok_calls: int):  # noqa: ANN205
+        """A profile handler that succeeds ``ok_calls`` times, then 403s."""
+        state = {"calls": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            state["calls"] += 1
+            if state["calls"] <= ok_calls:
+                return ok_profile(request)
+            return expired_token(request)
+
+        return handler, state
+
+    async def test_session_is_reverified_on_every_connect_cycle(self) -> None:
+        handler, state = self._profile_then_expire(ok_calls=99)
+        first = FakeSocket([SocketClosedError("drop")])
+        second = FakeSocket([HEARTBEAT])
+        provider, _ = build_provider([first, second], handler=handler)
+
+        await collect(provider, limit=12)
+        # Once before the first connect, once before the reconnect.
+        assert state["calls"] >= 2
+
+    async def test_token_expiring_mid_stream_stops_the_reconnect_loop(self) -> None:
+        """The token is live at startup and dead by the time we reconnect."""
+        handler, _ = self._profile_then_expire(ok_calls=1)
+        first = FakeSocket([frame(quote_packet(RELIANCE_TOKEN, 140000)), SocketClosedError("drop")])
+        second = FakeSocket([HEARTBEAT])
+        provider, urls = build_provider(
+            [first, second],
+            handler=handler,
+            policy=ReconnectPolicy(initial_seconds=0, max_seconds=0, jitter=0, max_attempts=0),
+        )
+
+        # Unlimited retries configured: if the loop did not detect the dead
+        # session it would never terminate, and this would hang rather than fail.
+        events = [event async for event in provider.stream()]
+
+        assert provider.state is ProviderState.AUTH_FAILED
+        assert provider.labelled_state == "ZERODHA_AUTH_FAILED"
+        kinds = [e.event_type for e in events if isinstance(e, ConnectionEvent)]
+        assert kinds[-1] is ConnectionEventType.AUTH_FAILED
+        # The second socket is never opened: only one connect was attempted.
+        assert len(urls) == 1
+
+    async def test_expired_token_does_not_retry_even_with_unlimited_attempts(self) -> None:
+        provider, urls = build_provider(
+            [FakeSocket([])],
+            handler=expired_token,
+            policy=ReconnectPolicy(initial_seconds=0, max_seconds=0, jitter=0, max_attempts=0),
+        )
+        events = [event async for event in provider.stream()]
+
+        assert provider.state is ProviderState.AUTH_FAILED
+        assert urls == []
+        connect_attempts = [
+            e
+            for e in events
+            if isinstance(e, ConnectionEvent)
+            and e.event_type is ConnectionEventType.CONNECT_ATTEMPT
+        ]
+        assert connect_attempts == []
+
+    async def test_handshake_rejection_with_403_is_an_auth_failure(self) -> None:
+        """Kite refuses the socket upgrade itself when the token is dead."""
+
+        class RejectedError(Exception):
+            def __init__(self) -> None:
+                super().__init__("server rejected WebSocket connection: HTTP 403")
+                self.response = type("R", (), {"status_code": 403})()
+
+        async def connect(url: str):  # noqa: ANN202
+            raise RejectedError()
+
+        client = ZerodhaRestClient(
+            api_key="key",
+            access_token="token",  # noqa: S106 - dummy
+            client=httpx.AsyncClient(transport=httpx.MockTransport(ok_profile)),
+        )
+        provider = ZerodhaMarketDataProvider(
+            client,
+            clock=FixedClock(START),
+            connect_factory=connect,
+            reconnect=ReconnectPolicy(initial_seconds=0, max_seconds=0, jitter=0, max_attempts=0),
+        )
+
+        events = [event async for event in provider.stream()]
+        assert provider.state is ProviderState.AUTH_FAILED
+        assert events[-1].event_type is ConnectionEventType.AUTH_FAILED
+
+    async def test_transient_connection_failure_still_retries(self) -> None:
+        """A non-auth failure must keep the existing reconnect behaviour."""
+
+        class FlakyError(Exception):
+            """No ``response`` attribute, so it is not an auth rejection."""
+
+        attempts = {"n": 0}
+        good = FakeSocket([frame(quote_packet(RELIANCE_TOKEN, 140000))])
+
+        async def connect(url: str):  # noqa: ANN202
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise FlakyError("connection reset")
+            return good
+
+        client = ZerodhaRestClient(
+            api_key="key",
+            access_token="token",  # noqa: S106 - dummy
+            client=httpx.AsyncClient(transport=httpx.MockTransport(ok_profile)),
+        )
+        provider = ZerodhaMarketDataProvider(
+            client,
+            clock=FixedClock(START),
+            connect_factory=connect,
+            reconnect=ReconnectPolicy(initial_seconds=0, max_seconds=0, jitter=0, max_attempts=0),
+        )
+
+        events = await collect(provider, limit=14)
+        # Two failures were retried rather than treated as terminal, and the
+        # third attempt delivered data.
+        assert attempts["n"] >= 3
+        assert provider.state is not ProviderState.AUTH_FAILED
+        assert any(isinstance(e, TickBatch) for e in events)
+
+    async def test_transport_failure_on_the_session_check_backs_off_and_recovers(self) -> None:
+        """A profile call that fails for a network reason is retryable, not fatal."""
+        state = {"calls": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return httpx.Response(
+                    503, json={"message": "upstream", "error_type": "NetworkException"}
+                )
+            return ok_profile(request)
+
+        provider, _ = build_provider([FakeSocket([HEARTBEAT])], handler=handler)
+        events = await collect(provider, limit=10)
+
+        kinds = [e.event_type for e in events if isinstance(e, ConnectionEvent)]
+        # The failed session check is reported, backed off, then retried - and
+        # no socket is opened until the session verifies.
+        assert kinds[0] is ConnectionEventType.PROVIDER_ERROR
+        assert kinds[1] is ConnectionEventType.AUTH_SUCCEEDED
+        assert kinds[2] is ConnectionEventType.CONNECT_ATTEMPT
+        assert provider.state is not ProviderState.AUTH_FAILED
+
+    async def test_exhausted_attempts_reach_a_safe_stopped_state(self) -> None:
+        provider, _ = build_provider(
+            [],  # every connect attempt fails: "no more sockets"
+            policy=ReconnectPolicy(initial_seconds=0, max_seconds=0, jitter=0, max_attempts=2),
+        )
+        events = [event async for event in provider.stream()]
+
+        assert provider.state is ProviderState.STOPPED
+        assert provider.state is not ProviderState.CONNECTED
+        reasons = [
+            str(e.detail.get("reason", "")) for e in events if isinstance(e, ConnectionEvent)
+        ]
+        assert any("exhausted" in r or "no more sockets" in r for r in reasons)
+
+
+class TestAccessTokenNeverLeaks:
+    """A synthetic access token must not survive into any observable output.
+
+    The streaming URL carries the token in its query string, so any exception
+    that quotes the URL carries the credential with it. That text becomes a
+    ConnectionEvent detail, which is persisted and logged.
+    """
+
+    TOKEN = "synthetic-access-token-abc123xyz"  # noqa: S105 - dummy, never real
+
+    async def test_token_in_a_connect_exception_reaches_neither_event_nor_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        captured_urls: list[str] = []
+
+        async def connect(url: str):  # noqa: ANN202
+            captured_urls.append(url)
+            # Mirrors websockets' InvalidURI, which quotes the whole URL.
+            raise ValueError(f"{url} isn't a valid URI")
+
+        client = ZerodhaRestClient(
+            api_key="key",
+            access_token=self.TOKEN,
+            client=httpx.AsyncClient(transport=httpx.MockTransport(ok_profile)),
+        )
+        provider = ZerodhaMarketDataProvider(
+            client,
+            clock=FixedClock(START),
+            connect_factory=connect,
+            reconnect=ReconnectPolicy(initial_seconds=0, max_seconds=0, jitter=0, max_attempts=1),
+        )
+
+        with caplog.at_level("DEBUG"):
+            events = [event async for event in provider.stream()]
+
+        # The token really was in the URL handed to the transport...
+        assert captured_urls and self.TOKEN in captured_urls[0]
+
+        # ...and nowhere in anything we emit, persist or log.
+        errors = [
+            e
+            for e in events
+            if isinstance(e, ConnectionEvent) and e.event_type is ConnectionEventType.PROVIDER_ERROR
+        ]
+        assert errors, "the failure must still be reported"
+        for event in events:
+            if isinstance(event, ConnectionEvent):
+                assert self.TOKEN not in repr(event.detail)
+        assert self.TOKEN not in caplog.text
+
+        # The endpoint stays diagnosable: the error still names its cause.
+        reason = str(errors[0].detail["reason"])
+        assert "ValueError" in reason
+        assert "wss://ws.kite.trade" in reason
+        assert "access_token=" in reason
+        assert "REDACTED" in reason

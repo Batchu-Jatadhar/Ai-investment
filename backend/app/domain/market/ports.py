@@ -29,6 +29,7 @@ from app.domain.market.models import (
     MarketTick,
     TickMode,
 )
+from app.domain.market.quality import DataQualityEvent
 
 __all__ = [
     "ConnectionEvent",
@@ -167,11 +168,17 @@ class InstrumentSource(Protocol):
     async def fetch_instruments(self, exchange: str | None = None) -> list[Instrument]: ...
 
 
+@runtime_checkable
 class MarketDataRepository(Protocol):
     """Persistence and query surface for market data.
 
     Downstream modules ask this, not the provider. Whether an answer comes from
     the live stream, the database or a replay source is not their concern.
+
+    Every method a domain or service module calls must be declared here. A
+    caller reaching past the port for an implementation-specific method is the
+    seam quietly failing: a substitute repository that satisfies this protocol
+    would then break at runtime.
     """
 
     # -- instruments ----------------------------------------------------
@@ -182,6 +189,10 @@ class MarketDataRepository(Protocol):
     def get_instrument_by_token(self, instrument_token: int) -> Instrument | None: ...
 
     def get_instrument_by_symbol(self, exchange: str, tradingsymbol: str) -> Instrument | None: ...
+
+    def all_instruments(self, limit: int = 100_000) -> list[Instrument]:
+        """Every stored instrument, for populating an in-memory lookup cache."""
+        ...
 
     def instrument_count(self) -> int: ...
 
@@ -220,3 +231,7 @@ class MarketDataRepository(Protocol):
     def record_connection_event(self, event: ConnectionEvent) -> None: ...
 
     def record_data_gap(self, gap: DataGap) -> None: ...
+
+    def record_quality_events(self, events: Sequence[DataQualityEvent]) -> int:
+        """Persist rejected or suspicious ticks. Nothing is discarded silently."""
+        ...

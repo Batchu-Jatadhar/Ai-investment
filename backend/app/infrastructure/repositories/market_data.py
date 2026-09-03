@@ -15,9 +15,9 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import CursorResult, delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.logging import get_logger
@@ -277,9 +277,10 @@ class SqlMarketDataRepository:
     def prune_ticks_before(self, cutoff: datetime) -> int:
         """Tick retention is a policy, not an accident. Candles are kept."""
         with self._write() as session:
-            result = session.execute(
-                delete(MarketTickRecord).where(MarketTickRecord.received_at < cutoff)
-            )
+            # DML through Session.execute returns a CursorResult at runtime;
+            # SQLAlchemy types it as the wider Result, which has no rowcount.
+            statement = delete(MarketTickRecord).where(MarketTickRecord.received_at < cutoff)
+            result = cast(CursorResult[Any], session.execute(statement))
             return int(result.rowcount or 0)
 
     @staticmethod

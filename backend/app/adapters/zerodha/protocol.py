@@ -5,9 +5,9 @@ https://kite.trade/docs/connect/v3/websocket/ .
 
 Frame layout (big-endian throughout)::
 
-    [0:2]   int16   number of packets in this frame
+    [0:2]   uint16  number of packets in this frame
     then, for each packet:
-    [n:n+2] int16   packet length
+    [n:n+2] uint16  packet length
     [.....] bytes   packet payload
 
 Packet length selects the layout - there is no explicit type field::
@@ -24,6 +24,13 @@ instrument token::
     CDS (3)  -> divide by 10,000,000     (four decimal currency quotes)
     BCD (6)  -> divide by 10,000
     others   -> divide by 100
+
+Every integer in the frame is **unsigned** big-endian, and is decoded as such.
+That matters for the cumulative counters: a day volume or a total buy/sell
+quantity above 2,147,483,647 decodes as a negative number under a signed read,
+and the validator then throws the whole tick away as an invalid quantity. The
+one signed quantity in the specification - an index packet's price change - is
+not read here, because nothing downstream consumes it.
 
 Nothing here raises on bad input. Malformed frames are reported as structured
 findings so the data-quality layer can count them; the stream must not die
@@ -143,11 +150,12 @@ def _timestamp(raw: int) -> datetime | None:
 
 
 def _parse_depth(chunk: bytes, divisor: Decimal) -> MarketDepth:
+    """Ten 12-byte entries: uint32 quantity, uint32 price, uint16 orders, 2 padding."""
     bids: list[DepthLevel] = []
     asks: list[DepthLevel] = []
     for index in range(_DEPTH_LEVELS * 2):
         offset = index * _DEPTH_ENTRY
-        quantity, raw_price, orders = struct.unpack_from(">iiH", chunk, offset)
+        quantity, raw_price, orders = struct.unpack_from(">IIH", chunk, offset)
         level = DepthLevel(price=_price(raw_price, divisor), quantity=quantity, orders=orders)
         (bids if index < _DEPTH_LEVELS else asks).append(level)
     return MarketDepth(bids=tuple(bids), asks=tuple(asks))
@@ -160,12 +168,12 @@ def _parse_packet(
     if size < PACKET_LTP:
         return ProtocolFinding("packet_too_short", {"length": size})
 
-    token = struct.unpack_from(">i", packet, 0)[0]
+    token = struct.unpack_from(">I", packet, 0)[0]
     divisor = divisor_for_token(token)
     index_packet = size in (PACKET_INDEX_QUOTE, PACKET_INDEX_FULL)
 
     if size == PACKET_LTP:
-        (last_price,) = struct.unpack_from(">i", packet, 4)
+        (last_price,) = struct.unpack_from(">I", packet, 4)
         return MarketTick(
             instrument_token=token,
             last_price=_price(last_price, divisor),
@@ -176,11 +184,13 @@ def _parse_packet(
         )
 
     if index_packet:
-        # token, ltp, high, low, open, close, price_change [, exchange_ts]
-        values = struct.unpack_from(">6i", packet, 0)
+        # token, ltp, high, low, open, close [, price_change, exchange_ts].
+        # price_change at 24:28 is the one signed field in the specification and
+        # is deliberately not read - nothing downstream consumes it.
+        values = struct.unpack_from(">6I", packet, 0)
         exchange_ts = None
         if size == PACKET_INDEX_FULL:
-            exchange_ts = _timestamp(struct.unpack_from(">i", packet, 28)[0])
+            exchange_ts = _timestamp(struct.unpack_from(">I", packet, 28)[0])
         return MarketTick(
             instrument_token=token,
             last_price=_price(values[1], divisor),
@@ -198,7 +208,9 @@ def _parse_packet(
     if size not in (PACKET_QUOTE, PACKET_FULL):
         return ProtocolFinding("unknown_packet_size", {"length": size, "token": token})
 
-    quote = struct.unpack_from(">11i", packet, 0)
+    # token, ltp, last_qty, avg_price, volume, total_buy_qty, total_sell_qty,
+    # open, high, low, close - all uint32.
+    quote = struct.unpack_from(">11I", packet, 0)
     tick_kwargs: dict[str, object] = {
         "instrument_token": token,
         "last_price": _price(quote[1], divisor),
@@ -219,7 +231,8 @@ def _parse_packet(
     if size == PACKET_QUOTE:
         return MarketTick(mode=TickMode.QUOTE, **tick_kwargs)  # type: ignore[arg-type]
 
-    extra = struct.unpack_from(">5i", packet, 44)
+    # last_traded_ts, open_interest, oi_day_high, oi_day_low, exchange_ts.
+    extra = struct.unpack_from(">5I", packet, 44)
     tick_kwargs.update(
         {
             "mode": TickMode.FULL,
@@ -244,8 +257,8 @@ def parse_frame(payload: bytes, received_at: datetime, *, source: str = "zerodha
     findings: list[ProtocolFinding] = []
     ticks: list[MarketTick] = []
 
-    (count,) = struct.unpack_from(">h", payload, 0)
-    if count <= 0:
+    (count,) = struct.unpack_from(">H", payload, 0)
+    if count == 0:
         return ParsedFrame(heartbeat=True)
 
     offset = 2
@@ -259,9 +272,9 @@ def parse_frame(payload: bytes, received_at: datetime, *, source: str = "zerodha
                 )
             )
             break
-        (length,) = struct.unpack_from(">h", payload, offset)
+        (length,) = struct.unpack_from(">H", payload, offset)
         offset += 2
-        if length <= 0 or offset + length > total:
+        if length == 0 or offset + length > total:
             findings.append(
                 ProtocolFinding(
                     "truncated_packet",

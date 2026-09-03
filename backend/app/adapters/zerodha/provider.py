@@ -9,7 +9,7 @@ Lifecycle::
     AUTHENTICATED  -> (profile call succeeds)   | AUTH_FAILED (403/TokenException)
     CONNECTING     -> CONNECTED -> ... -> DISCONNECTED -> CONNECTING (reconnect)
 
-Two rules the reconnect loop obeys:
+Three rules the reconnect loop obeys:
 
 *   **A reconnect always produces a recorded gap.** The stream was not
     delivering between the disconnect and the resubscribe, and any bar
@@ -18,6 +18,12 @@ Two rules the reconnect loop obeys:
 *   **Authentication failure does not retry.** Kite access tokens expire at
     06:00 IST daily and can only be renewed by an interactive login; a retry
     loop against a dead token burns rate limit and hides the real problem.
+*   **The session is re-verified on every connect cycle, not once at startup.**
+    A stream running across 06:00 IST loses its session mid-flight. Without a
+    fresh check the loop cannot tell a dead token from a flaky network, so it
+    would retry an unrecoverable state forever. Renewing the token needs an
+    interactive Kite login that this process cannot perform, so the terminal
+    state is ``AUTH_FAILED`` and the operator supplies a new token out of band.
 
 The socket is injected through ``connect_factory`` so the test suite can drive
 the whole lifecycle from recorded frames without touching the live API.
@@ -40,7 +46,7 @@ from app.adapters.zerodha.errors import (
     ZerodhaNotConfiguredError,
 )
 from app.adapters.zerodha.protocol import ParsedFrame, parse_frame
-from app.core.logging import get_logger
+from app.core.logging import describe_exception, get_logger, sanitize_text
 from app.core.time import Clock, SystemClock
 from app.domain.market.models import TickMode
 from app.domain.market.ports import (
@@ -95,7 +101,29 @@ class ReconnectPolicy:
 async def _default_connect(url: str) -> WebSocketLike:
     from websockets.asyncio.client import connect  # imported lazily for testability
 
-    return await connect(url, max_size=None)  # type: ignore[return-value]
+    return await connect(url, max_size=None)
+
+
+#: HTTP statuses a WebSocket handshake uses to reject a dead or unauthorised
+#: session. Retrying either is pointless - only a fresh token clears them.
+_AUTH_REJECTION_STATUSES = frozenset({401, 403})
+
+
+def auth_failure_reason(exc: BaseException) -> str | None:
+    """Sanitized reason when ``exc`` means "the session is gone", else ``None``.
+
+    Two shapes reach here. A :class:`ZerodhaAuthError` comes from the REST
+    session check. A handshake rejection comes from the socket itself: the
+    ``websockets`` client raises an error carrying the HTTP response, and Kite
+    answers an expired token with 403 before the socket ever opens. Everything
+    else - DNS, TCP, timeouts, 5xx - is transient and must keep retrying.
+    """
+    if isinstance(exc, ZerodhaAuthError):
+        return describe_exception(exc)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in _AUTH_REJECTION_STATUSES:
+        return f"{type(exc).__name__}: websocket handshake rejected with HTTP {status}"
+    return None
 
 
 class ZerodhaMarketDataProvider:
@@ -200,10 +228,10 @@ class ZerodhaMarketDataProvider:
             profile = await self._client.verify_session()
         except ZerodhaAuthError as exc:
             self._set_state(ProviderState.AUTH_FAILED)
-            return self._event(ConnectionEventType.AUTH_FAILED, reason=str(exc))
+            return self._event(ConnectionEventType.AUTH_FAILED, reason=sanitize_text(str(exc)))
         except ZerodhaError as exc:
             self._set_state(ProviderState.DISCONNECTED)
-            return self._event(ConnectionEventType.PROVIDER_ERROR, reason=str(exc))
+            return self._event(ConnectionEventType.PROVIDER_ERROR, reason=sanitize_text(str(exc)))
         self._set_state(ProviderState.AUTHENTICATED)
         return self._event(
             ConnectionEventType.AUTH_SUCCEEDED,
@@ -283,30 +311,55 @@ class ZerodhaMarketDataProvider:
     # ------------------------------------------------------------------ #
 
     async def stream(self) -> AsyncIterator[StreamEvent]:
-        """Run the connect / receive / reconnect loop, yielding events.
+        """Run the authenticate / connect / receive / reconnect loop.
 
         Terminates on authentication failure, on missing configuration, or when
         the reconnect policy is exhausted. It never terminates silently: the
-        final event explains why.
+        final event explains why, and it never retries a state that retrying
+        cannot fix.
         """
         self._running = True
         attempt = 0
 
-        auth_event = await self.authenticate()
-        yield auth_event
-        if self._state in (ProviderState.NOT_CONFIGURED, ProviderState.AUTH_FAILED):
-            self._running = False
-            return
-
         while self._running:
+            # Every cycle, not just the first: a token that was live when the
+            # stream started can be dead by the time it reconnects.
+            auth_event = await self.authenticate()
+            yield auth_event
+            if self._state in (ProviderState.NOT_CONFIGURED, ProviderState.AUTH_FAILED):
+                self._running = False
+                return
+            if self._state is ProviderState.DISCONNECTED:
+                # The session check failed for a transport reason. That is
+                # retryable, but opening a socket now would only fail again, so
+                # back off instead of burning an attempt on it.
+                attempt += 1
+                if not self._policy.should_retry(attempt):
+                    yield self._event(
+                        ConnectionEventType.PROVIDER_ERROR,
+                        reason="reconnect attempts exhausted",
+                    )
+                    self._set_state(ProviderState.STOPPED)
+                    return
+                await asyncio.sleep(self._policy.delay_for(attempt))
+                continue
+
             try:
                 yield self._event(ConnectionEventType.CONNECT_ATTEMPT, attempt=attempt + 1)
                 await self._open_socket()
-            except Exception as exc:  # noqa: BLE001 - any connect failure is retryable
+            except Exception as exc:  # noqa: BLE001 - classified below, then retried
+                auth_reason = auth_failure_reason(exc)
+                if auth_reason is not None:
+                    # Only an interactive Kite login mints a new token, and this
+                    # process cannot perform one. Stop and say so.
+                    self._set_state(ProviderState.AUTH_FAILED)
+                    yield self._event(ConnectionEventType.AUTH_FAILED, reason=auth_reason)
+                    self._running = False
+                    return
                 attempt += 1
                 yield self._event(
                     ConnectionEventType.PROVIDER_ERROR,
-                    reason=f"{type(exc).__name__}: {exc}",
+                    reason=describe_exception(exc),
                     attempt=attempt,
                 )
                 if not self._policy.should_retry(attempt):
@@ -344,7 +397,7 @@ class ZerodhaMarketDataProvider:
             except Exception as exc:  # noqa: BLE001 - transport failures are expected
                 yield self._event(
                     ConnectionEventType.DISCONNECTED,
-                    reason=f"{type(exc).__name__}: {exc}",
+                    reason=describe_exception(exc),
                 )
 
             if not self._running:
@@ -407,7 +460,8 @@ class ZerodhaMarketDataProvider:
         kind = payload.get("type")
         if kind == "error":
             return self._event(
-                ConnectionEventType.PROVIDER_ERROR, reason=str(payload.get("data", ""))
+                ConnectionEventType.PROVIDER_ERROR,
+                reason=sanitize_text(str(payload.get("data", ""))),
             )
         if kind == "message":
             return self._event(

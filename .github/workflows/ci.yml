@@ -52,6 +52,9 @@ jobs:
       - name: Format check
         run: ruff format --check .
 
+      - name: Type check
+        run: mypy
+
       - name: Migrate (PostgreSQL)
         env:
           DATABASE_URL: postgresql+psycopg://aitrade:aitrade@localhost:5432/aitrade_test
@@ -119,9 +122,31 @@ jobs:
 
       - name: Fail on credential-shaped content
         run: |
-          # .env.example must contain names only, never values.
-          if grep -nE '^(ZERODHA_[A-Z_]+|ANTHROPIC_API_KEY|TRADINGVIEW_WEBHOOK_SECRET)=.+' .env.example; then
-            echo "::error::.env.example must declare names with empty values"
+          # Secret-bearing fields only. The previous pattern matched
+          # ZERODHA_[A-Z_]+, which also caught ZERODHA_API_ROOT, ZERODHA_WS_ROOT
+          # and ZERODHA_TIMEOUT_SECONDS - legitimate, non-secret configuration
+          # that must carry a value. A gate that is always red is a gate nobody
+          # reads, so it is scoped to the fields that actually hold a credential.
+          SECRET_FIELDS='ZERODHA_API_KEY|ZERODHA_API_SECRET|ZERODHA_ACCESS_TOKEN|ANTHROPIC_API_KEY|TRADINGVIEW_WEBHOOK_SECRET'
+          PATTERN="^(${SECRET_FIELDS})=[[:space:]]*[^[:space:]]"
+
+          # Self-test the pattern before trusting it: it must catch a populated
+          # secret and must ignore a non-secret setting that carries a value.
+          POSITIVE=$(printf 'ZERODHA_ACCESS_TOKEN=abc123\n')
+          NEGATIVE=$(printf 'ZERODHA_API_ROOT=https://api.kite.trade\nZERODHA_WS_ROOT=wss://ws.kite.trade\nZERODHA_TIMEOUT_SECONDS=15\nZERODHA_ACCESS_TOKEN=\n')
+          if ! printf '%s\n' "$POSITIVE" | grep -qE "$PATTERN"; then
+            echo "::error::secret-scan pattern failed its positive self-test"
+            exit 1
+          fi
+          if printf '%s\n' "$NEGATIVE" | grep -qE "$PATTERN"; then
+            echo "::error::secret-scan pattern failed its negative self-test"
+            exit 1
+          fi
+          echo "secret-scan pattern self-test passed"
+
+          # .env.example must declare secret names with empty values.
+          if grep -nE "$PATTERN" .env.example; then
+            echo "::error::.env.example must declare secret names with empty values"
             exit 1
           fi
           echo "no populated credential fields in .env.example"

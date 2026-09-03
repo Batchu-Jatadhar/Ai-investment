@@ -171,7 +171,7 @@ class InstrumentMaster:
 
     def load_from_repository(self) -> int:
         """Populate the lookup cache from what is already stored."""
-        instruments = self._repository.all_instruments()  # type: ignore[attr-defined]
+        instruments = self._repository.all_instruments()
         self._index(instruments)
         self._loaded_at = self._repository.instruments_retrieved_at()
         return len(instruments)

@@ -220,3 +220,157 @@ class TestMalformedFrames:
         parsed = parse_frame(payload, BASE_TIME)
         assert len(parsed.ticks) == 2
         assert len(parsed.findings) == 1
+
+
+UINT32_MAX = 2**32 - 1
+INT32_MAX = 2**31 - 1
+
+
+def unsigned_quote_packet(
+    token: int,
+    last_price_paise: int,
+    *,
+    last_quantity: int = 10,
+    average_price: int = 0,
+    volume: int = 1000,
+    total_buy: int = 500,
+    total_sell: int = 400,
+) -> bytes:
+    """A 44-byte quote packet packed as the specification defines it: uint32.
+
+    The shared helper packs signed, which cannot even represent the values this
+    class exists to test.
+    """
+    return struct.pack(
+        ">11I",
+        token,
+        last_price_paise,
+        last_quantity,
+        average_price or last_price_paise,
+        volume,
+        total_buy,
+        total_sell,
+        last_price_paise,
+        last_price_paise,
+        last_price_paise,
+        last_price_paise,
+    )
+
+
+def unsigned_frame(*packets: bytes) -> bytes:
+    out = struct.pack(">H", len(packets))
+    for packet in packets:
+        out += struct.pack(">H", len(packet)) + packet
+    return out
+
+
+class TestUnsignedDecoding:
+    """Every integer in a Kite frame is unsigned.
+
+    Read as signed, a cumulative counter past 2,147,483,647 comes back negative
+    and the validator then discards the whole tick as an invalid quantity - a
+    real tick lost to a decoder bug, on exactly the high-volume instruments most
+    worth watching.
+    """
+
+    def test_volume_above_the_signed_boundary_stays_positive(self) -> None:
+        volume = 3_000_000_000
+        assert volume > INT32_MAX
+        payload = unsigned_frame(unsigned_quote_packet(RELIANCE_TOKEN, 140000, volume=volume))
+        parsed = parse_frame(payload, BASE_TIME)
+
+        assert parsed.is_clean
+        assert parsed.ticks[0].volume == volume
+
+    def test_total_buy_and_sell_quantities_above_the_signed_boundary(self) -> None:
+        big_buy, big_sell = 2_500_000_000, 4_000_000_000
+        payload = unsigned_frame(
+            unsigned_quote_packet(RELIANCE_TOKEN, 140000, total_buy=big_buy, total_sell=big_sell)
+        )
+        parsed = parse_frame(payload, BASE_TIME)
+        tick = parsed.ticks[0]
+
+        assert tick.total_buy_quantity == big_buy
+        assert tick.total_sell_quantity == big_sell
+        assert tick.total_buy_quantity > 0 and tick.total_sell_quantity > 0
+
+    def test_last_quantity_above_the_signed_boundary(self) -> None:
+        quantity = INT32_MAX + 1
+        payload = unsigned_frame(
+            unsigned_quote_packet(RELIANCE_TOKEN, 140000, last_quantity=quantity)
+        )
+        assert parse_frame(payload, BASE_TIME).ticks[0].last_quantity == quantity
+
+    def test_maximum_uint32_decodes_without_wrapping(self) -> None:
+        payload = unsigned_frame(unsigned_quote_packet(RELIANCE_TOKEN, 140000, volume=UINT32_MAX))
+        assert parse_frame(payload, BASE_TIME).ticks[0].volume == UINT32_MAX
+
+    def test_a_large_instrument_token_is_not_misread(self) -> None:
+        """Token 3,000,000,001 keeps segment 1 (NSE) and stays positive."""
+        token = 3_000_000_001
+        assert token > INT32_MAX
+        assert segment_of_token(token) == 1
+        payload = unsigned_frame(unsigned_quote_packet(token, 140000))
+        tick = parse_frame(payload, BASE_TIME).ticks[0]
+
+        assert tick.instrument_token == token
+        assert tick.is_index is False
+
+    def test_depth_quantity_above_the_signed_boundary(self) -> None:
+        """Depth entries are uint32 quantity, uint32 price, uint16 orders."""
+        quantity = 3_500_000_000
+        head = unsigned_quote_packet(RELIANCE_TOKEN, 140000)
+        middle = struct.pack(">5I", 0, 0, 0, 0, 0)
+        body = b""
+        for _ in range(10):
+            body += struct.pack(">IIHH", quantity, 139999, 7, 0)
+        packet = head + middle + body
+        assert len(packet) == 184
+
+        parsed = parse_frame(unsigned_frame(packet), BASE_TIME)
+        depth = parsed.ticks[0].depth
+
+        assert depth is not None
+        assert depth.bids[0].quantity == quantity
+        assert depth.asks[0].quantity == quantity
+
+    def test_a_timestamp_past_2038_is_not_negative(self) -> None:
+        """uint32 epoch seconds run to 2106; signed decoding breaks in 2038."""
+        beyond_2038 = 2_500_000_000
+        assert beyond_2038 > INT32_MAX
+        head = unsigned_quote_packet(RELIANCE_TOKEN, 140000)
+        middle = struct.pack(">5I", beyond_2038, 0, 0, 0, beyond_2038)
+        body = struct.pack(">IIHH", 1, 139999, 1, 0) * 10
+        parsed = parse_frame(unsigned_frame(head + middle + body), BASE_TIME)
+        tick = parsed.ticks[0]
+
+        assert tick.exchange_timestamp is not None
+        assert tick.exchange_timestamp.year == 2049
+        assert tick.last_traded_at is not None
+
+    def test_index_high_low_are_read_unsigned_and_price_change_is_ignored(self) -> None:
+        """price_change at 24:28 is the one signed field, and is not consumed."""
+        packet = struct.pack(
+            ">6I", NIFTY50_TOKEN, 2_500_000, 2_600_000, 2_400_000, 2_450_000, 2_480_000
+        )
+        packet += struct.pack(">i", -12345)  # a falling index: legitimately negative
+        parsed = parse_frame(unsigned_frame(packet), BASE_TIME)
+        tick = parsed.ticks[0]
+
+        assert tick.is_index is True
+        assert tick.high_price == Decimal("26000")
+        assert tick.low_price == Decimal("24000")
+
+    def test_a_frame_declaring_many_packets_is_counted_unsigned(self) -> None:
+        packets = [unsigned_quote_packet(RELIANCE_TOKEN, 140000 + n) for n in range(40)]
+        parsed = parse_frame(unsigned_frame(*packets), BASE_TIME)
+
+        assert parsed.is_clean
+        assert len(parsed.ticks) == 40
+
+    def test_a_zero_length_packet_is_still_reported_as_truncated(self) -> None:
+        payload = struct.pack(">H", 1) + struct.pack(">H", 0)
+        parsed = parse_frame(payload, BASE_TIME)
+
+        assert parsed.ticks == ()
+        assert parsed.findings[0].reason == "truncated_packet"

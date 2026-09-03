@@ -12,8 +12,10 @@ from app.core.logging import (
     JsonFormatter,
     RedactionFilter,
     configure_logging,
+    describe_exception,
     get_correlation_id,
     redact,
+    sanitize_text,
     set_correlation_id,
 )
 
@@ -99,3 +101,54 @@ class TestRedaction:
         assert "zzz-secret" not in out
         assert REDACTED in out
         assert "TCS" in out
+
+
+class TestUrlCredentialSanitization:
+    """A credential in a URL query string survives every key-name check.
+
+    The Kite streaming endpoint carries the access token in its query string, so
+    an exception quoting that URL carries the secret into whatever formats it.
+    """
+
+    TOKEN = "synthetic-token-9f8e7d6c5b4a"  # noqa: S105 - dummy, never real
+
+    def test_access_token_in_a_url_is_masked(self) -> None:
+        url = f"wss://ws.kite.trade?api_key=abc123&access_token={self.TOKEN}"
+        cleaned = sanitize_text(f"InvalidURI: {url} isn't a valid URI")
+
+        assert self.TOKEN not in cleaned
+        assert "abc123" not in cleaned
+        # The endpoint survives, so the error stays diagnosable.
+        assert "wss://ws.kite.trade" in cleaned
+        assert "access_token=" in cleaned
+        assert REDACTED in cleaned
+
+    def test_describe_exception_masks_and_keeps_the_type(self) -> None:
+        exc = ValueError(f"wss://ws.kite.trade?access_token={self.TOKEN} rejected")
+        described = describe_exception(exc)
+
+        assert described.startswith("ValueError: ")
+        assert self.TOKEN not in described
+        assert REDACTED in described
+
+    def test_request_token_and_checksum_are_masked(self) -> None:
+        cleaned = sanitize_text(
+            "POST /session/token?request_token=rt-abc&checksum=deadbeefcafe failed"
+        )
+        assert "rt-abc" not in cleaned
+        assert "deadbeefcafe" not in cleaned
+
+    def test_a_kite_authorization_header_value_is_masked(self) -> None:
+        cleaned = sanitize_text("Authorization: token apikey123:accesstoken456")
+        assert "accesstoken456" not in cleaned
+
+    def test_ordinary_urls_are_left_alone(self) -> None:
+        url = "https://api.kite.trade/instruments/NSE?limit=50"
+        assert sanitize_text(url) == url
+
+    def test_the_log_filter_masks_a_url_in_an_extra(self, caplog: pytest.LogCaptureFixture) -> None:
+        logger = logging.getLogger("test.sanitize")
+        logger.addFilter(RedactionFilter())
+        with caplog.at_level(logging.INFO):
+            logger.info("connect_failed", extra={"reason": f"access_token={self.TOKEN}"})
+        assert self.TOKEN not in caplog.text

@@ -27,6 +27,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
+    "mypy>=1.13",
 ]
 
 [project.scripts]
@@ -68,3 +69,16 @@ extend-immutable-calls = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106", "S107"]  # dummy credentials in tests are intentional
+
+[tool.mypy]
+# Scoped to the application: the point is to catch genuine interface and type
+# errors - a caller reaching past a port for a method the port does not declare,
+# most of all - not to relitigate every annotation in the tree.
+python_version = "3.11"
+files = ["app"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+strict_equality = true

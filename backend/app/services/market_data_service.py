@@ -205,7 +205,7 @@ class MarketDataService:
             self._store_candles(completed)
 
         if issues:
-            self._repository.record_quality_events(issues)  # type: ignore[attr-defined]
+            self._repository.record_quality_events(issues)
 
     def _enrich(self, tick: MarketTick) -> MarketTick:
         """Attach symbol and exchange from the instrument master."""
@@ -291,7 +291,7 @@ class MarketDataService:
     def health(self, now: datetime | None = None) -> dict[str, object]:
         moment = now or self._clock.now()
         provider_health = (
-            self._provider.health(moment)  # type: ignore[attr-defined]
+            self._provider.health(moment)
             if hasattr(self._provider, "health")
             else {"provider": getattr(self._provider, "name", "unknown")}
         )

@@ -41,14 +41,64 @@ _SENSITIVE_KEY_PARTS = (
     "cookie",
 )
 
+REDACTED = "***REDACTED***"
+
+# Query-string parameters that carry a credential. Broker WebSocket URLs put the
+# access token in the query string (the Kite streaming endpoint is
+# ``wss://ws.kite.trade?api_key=...&access_token=...``), so any string that
+# quotes such a URL - an exception message, most of all - carries the secret in
+# a shape no key-name check can see.
+_CREDENTIAL_QUERY_PARAMS = (
+    "access_token",
+    "api_key",
+    "api_secret",
+    "auth_token",
+    "checksum",
+    "password",
+    "request_token",
+    "secret",
+    "token",
+)
+
+# Keeps the parameter name, replaces only its value: the endpoint stays
+# diagnosable, the credential does not survive.
+_QUERY_SECRET_PATTERN = re.compile(
+    r"\b(" + "|".join(_CREDENTIAL_QUERY_PARAMS) + r")=[^&\s\"'<>\\]+",
+    re.IGNORECASE,
+)
+
 # Values that look like credentials even when the key is innocuous.
 _SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"\bBearer\s+[A-Za-z0-9._\-]+", re.IGNORECASE),
+    re.compile(r"\btoken\s+[A-Za-z0-9._\-]+:[A-Za-z0-9._\-]+", re.IGNORECASE),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"\bsk-[A-Za-z0-9\-_]{20,}"),
 )
 
-REDACTED = "***REDACTED***"
+
+def sanitize_text(value: str) -> str:
+    """Mask credential-shaped content in a free-text string.
+
+    Call this at the point a string is *built* - an exception message about to
+    become a persisted event detail, say - not only on the way to a log handler.
+    A value that reaches the database never passes through the logging filter,
+    so relying on that filter alone leaves the database unprotected.
+    """
+    value = _QUERY_SECRET_PATTERN.sub(rf"\1={REDACTED}", value)
+    for pattern in _SENSITIVE_VALUE_PATTERNS:
+        value = pattern.sub(REDACTED, value)
+    return value
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Render an exception as ``Type: message`` with any credential masked.
+
+    Exception text is the most common way a secret escapes: a URL carrying an
+    access token lands in a transport error, which is then formatted into an
+    event detail and a log line.
+    """
+    return sanitize_text(f"{type(exc).__name__}: {exc}")
+
 
 # Reserved LogRecord attributes; anything else in __dict__ is caller-supplied extra.
 _RESERVED = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {
@@ -71,9 +121,7 @@ def get_correlation_id() -> str | None:
 
 def _redact_value(value: Any) -> Any:
     if isinstance(value, str):
-        for pattern in _SENSITIVE_VALUE_PATTERNS:
-            value = pattern.sub(REDACTED, value)
-        return value
+        return sanitize_text(value)
     if isinstance(value, dict):
         return redact(value)
     if isinstance(value, (list, tuple)):

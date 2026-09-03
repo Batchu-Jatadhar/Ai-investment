@@ -117,6 +117,18 @@ def health_db(response: Response) -> DatabaseHealthResponse:
     )
 
 
+def _section(snapshot: dict[str, object], key: str) -> dict[str, Any]:
+    """One sub-dictionary of a health snapshot, or an empty one.
+
+    The snapshot is a loosely typed observability bag assembled by the service.
+    Narrowing it here keeps the endpoint honest in both directions: the type
+    checker can verify the accesses below, and a snapshot missing a section
+    reports an empty section rather than raising inside a health check.
+    """
+    value = snapshot.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
 @router.get(
     "/health/market-data",
     response_model=MarketDataHealthResponse,
@@ -144,8 +156,8 @@ def health_market_data(response: Response) -> MarketDataHealthResponse:
 
     if service is not None:
         snapshot = service.health()
-        provider = snapshot.get("provider", {})
-        stream = snapshot.get("stream", {})
+        provider = _section(snapshot, "provider")
+        stream = _section(snapshot, "stream")
         connected = bool(provider.get("connected"))
         status_value = "ok" if connected else "degraded"
         if not provider.get("configured", configured):
@@ -165,10 +177,10 @@ def health_market_data(response: Response) -> MarketDataHealthResponse:
             stream=StreamHealth(
                 **{key: stream[key] for key in StreamHealth.model_fields if key in stream}
             ),
-            instruments=dict(snapshot.get("instruments", {})),
-            candles=dict(snapshot.get("candles", {})),
-            quality=dict(snapshot.get("quality", {})),
-            session=dict(snapshot.get("session", {})),
+            instruments=_section(snapshot, "instruments"),
+            candles=_section(snapshot, "candles"),
+            quality=_section(snapshot, "quality"),
+            session=_section(snapshot, "session"),
         )
 
     # No streamer in this process: report configuration and stored facts only.
