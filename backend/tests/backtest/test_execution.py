@@ -9,9 +9,13 @@ from decimal import Decimal
 import pytest
 
 from app.core.time import NaiveDatetimeError
-from app.domain.backtest.config import SlippageConfig
-from app.domain.backtest.execution import ExecutionIntent, resolve_stop_fill
-from app.domain.backtest.models import FillReason, OrderSide
+from app.domain.backtest.config import ExecutionConfig, SlippageConfig
+from app.domain.backtest.execution import (
+    ExecutionIntent,
+    resolve_stop_fill,
+    resolve_target_fill,
+)
+from app.domain.backtest.models import Fill, FillReason, OrderSide
 from app.domain.market.models import CandleInterval, CandleStatus
 from app.domain.strategy.contract import Signal, SignalDirection
 from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_OPEN, make_candle
@@ -298,3 +302,183 @@ class TestGuards:
         bar = position_bar(-1, open_="1400", high="1405", low="1388", close="1395")
         with pytest.raises(ValueError, match="precedes the entry bar"):
             stop_fill(make_intent(), bar)
+
+
+# --------------------------------------------------------------------------- #
+# Engine-fired target execution
+# --------------------------------------------------------------------------- #
+
+THROUGH_ONE_TICK = ExecutionConfig()
+THROUGH_NOTHING = ExecutionConfig(target_requires_through_ticks=0)
+THROUGH_TWO_TICKS = ExecutionConfig(target_requires_through_ticks=2)
+
+#: A long entered at 1400.00 with its stop at 1390.00 risks 10.00, so a 2R
+#: target sits at 1420.00 and the default trigger one tick through is 1420.05.
+LONG_TARGET = Decimal("1420.00")
+
+#: A short entered at 1400.00 with its stop at 1412.00 risks 12.00, so a 2R
+#: target sits at 1376.00 and the default trigger is 1375.95.
+SHORT_TARGET = Decimal("1376.00")
+
+
+def entry_fill(side: OrderSide = OrderSide.BUY) -> Fill:
+    return Fill(
+        side=side,
+        reason=FillReason.ENTRY,
+        quantity=70,
+        price=Decimal("1400.00"),
+        reference_price=Decimal("1400.00"),
+        slippage_per_unit=Decimal("0"),
+        costs=Decimal("0"),
+        occurred_at=NEXT_BAR,
+        bar_start=NEXT_BAR,
+    )
+
+
+def target_fill(  # noqa: ANN201
+    intent,  # noqa: ANN001
+    bar,  # noqa: ANN001
+    execution=THROUGH_ONE_TICK,  # noqa: ANN001
+    slippage=ONE_TICK,  # noqa: ANN001
+):
+    entry = entry_fill(OrderSide.BUY if intent.direction.is_long else OrderSide.SELL)
+    return resolve_target_fill(
+        intent, entry, bar, tick_size=TICK, execution=execution, slippage=slippage
+    )
+
+
+class TestLongTarget:
+    def test_trading_through_the_target_fills(self) -> None:
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        fill = target_fill(make_intent(), bar)
+
+        assert fill is not None
+        assert fill.side is OrderSide.SELL
+        assert fill.reason is FillReason.TARGET
+        assert fill.quantity == 70
+        assert fill.reference_price == LONG_TARGET
+        assert fill.price == Decimal("1419.95")
+
+    def test_reaching_the_target_exactly_does_not_fill(self) -> None:
+        """The engine fires on a through-print, and there was not one."""
+        bar = position_bar(open_="1405", high="1420.00", low="1404", close="1418")
+        assert target_fill(make_intent(), bar) is None
+
+    def test_stopping_one_tick_short_of_the_trigger_does_not_fill(self) -> None:
+        bar = position_bar(open_="1405", high="1420.04", low="1404", close="1418")
+        assert target_fill(make_intent(), bar) is None
+
+    def test_reaching_the_trigger_exactly_fills(self) -> None:
+        """Through by exactly the configured threshold is through by the
+        configured threshold."""
+        bar = position_bar(open_="1405", high="1420.05", low="1404", close="1419")
+        fill = target_fill(make_intent(), bar)
+
+        assert fill is not None
+        assert fill.reference_price == LONG_TARGET
+
+    def test_a_favourable_gap_is_not_credited_beyond_the_target(self) -> None:
+        """Taking the gap would assume the engine reacted faster than modelled.
+        The mirror of the stop, which is filled at the worse price a gap opened
+        at - neither exit is credited with the good half of a surprise."""
+        bar = position_bar(open_="1450", high="1460", low="1448", close="1455")
+        fill = target_fill(make_intent(), bar)
+
+        assert fill is not None
+        assert fill.reference_price == LONG_TARGET
+        assert fill.price == Decimal("1419.95")
+
+
+class TestShortTarget:
+    def test_trading_through_the_target_fills(self) -> None:
+        bar = position_bar(open_="1395", high="1396", low="1370", close="1374")
+        fill = target_fill(short_intent(), bar)
+
+        assert fill is not None
+        assert fill.side is OrderSide.BUY
+        assert fill.reason is FillReason.TARGET
+        assert fill.reference_price == SHORT_TARGET
+        assert fill.price == Decimal("1376.05")
+
+    def test_reaching_the_target_exactly_does_not_fill(self) -> None:
+        bar = position_bar(open_="1395", high="1396", low="1376.00", close="1380")
+        assert target_fill(short_intent(), bar) is None
+
+    def test_reaching_the_trigger_exactly_fills(self) -> None:
+        bar = position_bar(open_="1395", high="1396", low="1375.95", close="1380")
+        fill = target_fill(short_intent(), bar)
+
+        assert fill is not None
+        assert fill.reference_price == SHORT_TARGET
+
+
+class TestTheThresholdFollowsTheConfiguration:
+    def test_zero_through_ticks_makes_a_touch_enough(self) -> None:
+        """Resting-limit behaviour, if a run chooses to assume it."""
+        bar = position_bar(open_="1405", high="1420.00", low="1404", close="1418")
+
+        assert target_fill(make_intent(), bar, THROUGH_NOTHING) is not None
+        assert target_fill(make_intent(), bar, THROUGH_ONE_TICK) is None
+
+    def test_two_through_ticks_needs_the_extra_tick(self) -> None:
+        one_through = position_bar(open_="1405", high="1420.05", low="1404", close="1419")
+        two_through = position_bar(open_="1405", high="1420.10", low="1404", close="1419")
+
+        assert target_fill(make_intent(), one_through, THROUGH_TWO_TICKS) is None
+        assert target_fill(make_intent(), two_through, THROUGH_TWO_TICKS) is not None
+
+
+class TestTargetSlippage:
+    def test_slippage_is_adverse_in_both_directions(self) -> None:
+        long_bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        short_bar = position_bar(open_="1395", high="1396", low="1370", close="1374")
+
+        assert target_fill(make_intent(), long_bar, slippage=THREE_TICKS).price == Decimal(
+            "1419.85"
+        )
+        assert target_fill(short_intent(), short_bar, slippage=THREE_TICKS).price == Decimal(
+            "1376.15"
+        )
+
+    def test_without_slippage_the_fill_is_the_target(self) -> None:
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        fill = target_fill(make_intent(), bar, slippage=NO_SLIPPAGE)
+
+        assert fill is not None
+        assert fill.price == fill.reference_price == LONG_TARGET
+
+
+class TestTargetDeterminismAndGuards:
+    def test_the_same_bar_always_resolves_the_same_way(self) -> None:
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        assert target_fill(make_intent(), bar) == target_fill(make_intent(), bar)
+
+    def test_an_exit_fill_cannot_stand_in_for_the_entry(self) -> None:
+        """R is measured from the price actually paid to open the position."""
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        not_an_entry = dataclasses.replace(entry_fill(), reason=FillReason.STOP)
+
+        with pytest.raises(ValueError, match="must be an ENTRY fill"):
+            resolve_target_fill(
+                make_intent(),
+                not_an_entry,
+                bar,
+                tick_size=TICK,
+                execution=THROUGH_ONE_TICK,
+                slippage=ONE_TICK,
+            )
+
+    def test_an_entry_at_the_stop_has_no_target(self) -> None:
+        """Zero risk means no R multiple describes anything."""
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        at_the_stop = dataclasses.replace(entry_fill(), price=LONG_STOP, reference_price=LONG_STOP)
+
+        with pytest.raises(ValueError, match="risk is zero"):
+            resolve_target_fill(
+                make_intent(),
+                at_the_stop,
+                bar,
+                tick_size=TICK,
+                execution=THROUGH_ONE_TICK,
+                slippage=ONE_TICK,
+            )

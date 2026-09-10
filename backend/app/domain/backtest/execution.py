@@ -27,6 +27,29 @@ not a mistake: a breakout needs a *close strictly beyond* the level, while a
 stop triggers on a mere touch. They model different things. A breakout is an
 inference about intent from where the bar settled; a stop is an order already
 sitting in the book, and the book does not wait for a close.
+
+.. rubric:: The target
+
+:func:`resolve_target_fill` models the other exit, and models it differently on
+purpose. The target is **not** a resting limit order. It is fired by the engine
+as an IOC once it sees the price trade through the level, which is the accepted
+cost of OCO Design B: with only one protective order resting at the broker, the
+target has to be triggered rather than waited on, and a bar that merely reaches
+the level does not fill.
+
+That is where ``target_requires_through_ticks`` comes in. The bar must trade
+through the target by at least that many ticks before the engine is credited
+with having reacted.
+
+The two exits are pessimistic in opposite directions, and both deliberately:
+
+*   A **stop** that gaps fills at the worse price the bar opened at, because
+    that is what the market offered.
+*   A **target** that gaps fills at the target level and no better, because
+    crediting the whole favourable gap would assume an engine reaction faster
+    than the one being modelled.
+
+Neither exit is ever credited with the good half of a surprise.
 """
 
 from __future__ import annotations
@@ -36,12 +59,12 @@ from datetime import datetime
 from decimal import Decimal
 
 from app.core.time import ensure_utc
-from app.domain.backtest.config import SlippageConfig
+from app.domain.backtest.config import ExecutionConfig, SlippageConfig
 from app.domain.backtest.models import Fill, FillReason, OrderSide
 from app.domain.market.models import Candle, CandleStatus
 from app.domain.strategy.contract import Signal, SignalDirection
 
-__all__ = ["ExecutionIntent", "resolve_stop_fill"]
+__all__ = ["ExecutionIntent", "resolve_stop_fill", "resolve_target_fill"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,5 +207,99 @@ def resolve_stop_fill(
         # is that it had happened by the close. Intrabar timing is what the
         # 1-minute resolution phase is for; nothing here invents it.
         occurred_at=bar.start_at if gapped else bar.end_at,
+        bar_start=bar.start_at,
+    )
+
+
+def resolve_target_fill(
+    intent: ExecutionIntent,
+    entry: Fill,
+    bar: Candle,
+    *,
+    tick_size: Decimal,
+    execution: ExecutionConfig,
+    slippage: SlippageConfig,
+) -> Fill | None:
+    """The target's fill on ``bar``, or ``None`` if it was not reached.
+
+    The target level is resolved here rather than carried on the signal,
+    because R is measured from the entry and the entry is not known until the
+    fill. ``entry`` supplies it: risk is the distance from the fill to the
+    stop, and the target sits ``target_r_multiple`` of that distance the other
+    side of the fill. Two trades from the same signal at different fills have
+    different targets, which is exactly what an absolute target price on the
+    signal could not have expressed.
+
+    **Reaching the level is not enough.** The engine fires an IOC when it sees
+    the price trade through, so the bar must exceed the target by
+    ``target_requires_through_ticks``. Reaching the trigger exactly counts as
+    having traded through by exactly the threshold, and does fill; a graze that
+    stops one tick short does not. With the threshold configured to zero the
+    trigger is the target itself and a touch fills, which is the resting-limit
+    behaviour - the rule follows the configuration rather than being hard-coded
+    either way.
+
+    **A favourable gap is not credited.** However far through the bar went, the
+    fill is the target level, never the better price the bar opened at. Taking
+    the gap would assume the engine reacted faster than the model claims it
+    does. This is the mirror of the stop, which *is* filled at the worse price
+    a gap opened at - between them, neither exit is ever credited with the good
+    half of a surprise.
+
+    Slippage applies on top, adverse as always: a long exits lower, a short
+    exits higher. ``costs`` is ``0`` for the reason given on the stop.
+
+    Only ``bar`` is read. Nothing here can see the bars either side of it.
+    """
+    if entry.reason is not FillReason.ENTRY:
+        raise ValueError(
+            f"entry must be an ENTRY fill, got {entry.reason.value}; the target is measured "
+            "from the price actually paid to open the position"
+        )
+    if bar.status is not CandleStatus.COMPLETED:
+        raise ValueError(
+            f"the bar at {bar.start_at.isoformat()} is {bar.status.value}; a fill cannot be "
+            "resolved against a bar whose high and low can still move"
+        )
+    if bar.start_at < intent.entry_bar_start:
+        raise ValueError(
+            f"the bar at {bar.start_at.isoformat()} precedes the entry bar "
+            f"({intent.entry_bar_start.isoformat()}); a target cannot fill before the position "
+            "it closes exists"
+        )
+    if tick_size <= 0:
+        raise ValueError(f"tick_size must be positive, got {tick_size}")
+
+    is_long = intent.direction.is_long
+    risk = abs(entry.price - intent.signal.stop_price)
+    if risk == 0:
+        raise ValueError(
+            f"the entry filled at the stop ({entry.price}), so risk is zero and no R multiple "
+            "describes a target; such a trade should never have been opened"
+        )
+
+    reach = intent.signal.target_r_multiple * risk
+    target = entry.price + reach if is_long else entry.price - reach
+    through = execution.target_requires_through_ticks * tick_size
+    trigger = target + through if is_long else target - through
+
+    reached = bar.high >= trigger if is_long else bar.low <= trigger
+    if not reached:
+        return None
+
+    adverse = slippage.adverse_ticks * tick_size
+    price = target - adverse if is_long else target + adverse
+
+    return Fill(
+        side=intent.exit_side,
+        reason=FillReason.TARGET,
+        quantity=intent.quantity,
+        price=price,
+        reference_price=target,
+        slippage_per_unit=adverse,
+        costs=Decimal(0),
+        # The through-print happened somewhere inside the bar; all that can
+        # honestly be said is that it had happened by the close.
+        occurred_at=bar.end_at,
         bar_start=bar.start_at,
     )
