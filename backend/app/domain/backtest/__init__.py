@@ -16,6 +16,7 @@ broker, no ORM and no clock, and the architecture-purity tests enforce that.
 conflated with this simulation.
 """
 
+from app.domain.backtest.cash import CashLedger
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.backtest.execution import (
     EntryOutcome,
@@ -48,6 +49,7 @@ __all__ = [
     "AmbiguityResolution",
     "BacktestInput",
     "BacktestResult",
+    "CashLedger",
     "CostSchedule",
     "EntryOutcome",
     "EquityPoint",
