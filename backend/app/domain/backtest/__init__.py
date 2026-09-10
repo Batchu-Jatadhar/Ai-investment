@@ -41,6 +41,7 @@ from app.domain.backtest.models import (
     SignalRecord,
     Trade,
 )
+from app.domain.backtest.position import Position, PositionBook, PositionTransitionError
 
 __all__ = [
     "AmbiguityResolution",
@@ -57,6 +58,9 @@ __all__ = [
     "FillReason",
     "InvalidBacktestInputError",
     "OrderSide",
+    "Position",
+    "PositionBook",
+    "PositionTransitionError",
     "RunManifest",
     "SignalRecord",
     "SlippageConfig",
