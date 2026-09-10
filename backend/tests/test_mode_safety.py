@@ -226,17 +226,27 @@ class TestNoOrderCapabilityInSource:
 
 
 class TestDomainPurity:
-    """The strategy and backtest domain must stay pure and deterministic.
+    """The strategy, indicator and backtest domain must stay pure and deterministic.
 
-    Phase 2 adds two packages under ``app/domain``. They exist there precisely so
-    these scans apply to them: a strategy that could reach a broker, an ORM or a
-    clock would be neither independently testable nor reproducible, and the
-    reproducibility guarantee - same input, same result - would become a matter
-    of reviewer vigilance rather than a property of the code.
+    Phase 2 adds these modules under ``app/domain``. They live there precisely so
+    these scans apply to them: a strategy or an indicator that could reach a
+    broker, an ORM or a clock would be neither independently testable nor
+    reproducible, and the reproducibility guarantee - same input, same result -
+    would become a matter of reviewer vigilance rather than a property of the
+    code.
+
+    Anything added to this surface is covered automatically. A new pure module
+    must be listed in :data:`PURE_MODULES`, which is the one place that decides
+    what the guarantee applies to.
     """
 
     #: Packages that must be pure: no vendor, no persistence, no I/O, no clock.
     PURE_PACKAGES = ("strategy", "backtest")
+
+    #: Single-module members of the same surface. ``indicators`` is a module
+    #: rather than a package because it holds two functions, and the rules that
+    #: apply to it are identical.
+    PURE_MODULES = ("indicators.py",)
 
     @staticmethod
     def _domain_sources() -> list[pathlib.Path]:
@@ -249,12 +259,17 @@ class TestDomainPurity:
         paths: list[pathlib.Path] = []
         for package in cls.PURE_PACKAGES:
             paths.extend(sorted((root / package).rglob("*.py")))
-        assert paths, "the pure domain packages must exist"
+        paths.extend(root / module for module in cls.PURE_MODULES)
+        assert paths, "the pure domain surface must exist"
         return paths
 
-    def test_the_pure_packages_are_present(self) -> None:
-        names = {path.parent.name for path in self._pure_sources()}
-        assert set(self.PURE_PACKAGES) <= names
+    def test_the_pure_packages_and_modules_are_present(self) -> None:
+        """A scan over files that do not exist would pass without checking anything."""
+        found = self._pure_sources()
+        assert set(self.PURE_PACKAGES) <= {path.parent.name for path in found}
+        assert set(self.PURE_MODULES) <= {path.name for path in found}
+        missing = [str(path) for path in found if not path.is_file()]
+        assert missing == [], f"the purity scans point at files that do not exist: {missing}"
 
     def test_domain_never_imports_an_adapter_or_a_broker(self) -> None:
         forbidden = ("app.adapters", "kiteconnect", "zerodha", "websockets", "httpx")
@@ -276,8 +291,8 @@ class TestDomainPurity:
                     offenders.append(f"{path.name}: {needle}")
         assert offenders == [], f"the domain must not import persistence: {offenders}"
 
-    def test_strategy_and_backtest_never_import_orders_execution_or_ai(self) -> None:
-        """Architecture rule: strategy and exits never import broker, orders or ai."""
+    def test_pure_domain_never_imports_orders_execution_or_ai(self) -> None:
+        """Architecture rule: pure domain code never imports broker, orders or ai."""
         forbidden = (
             "app.domain.orders",
             "app.domain.execution",
@@ -294,7 +309,7 @@ class TestDomainPurity:
                     offenders.append(f"{path.name}: {needle}")
         assert offenders == [], f"pure domain code must not reach execution or AI: {offenders}"
 
-    def test_strategy_and_backtest_read_no_clock(self) -> None:
+    def test_pure_domain_reads_no_clock(self) -> None:
         """A run that reads a clock is not reproducible."""
         forbidden = ("datetime.now(", "utc_now(", "SystemClock", "time.time(", "monotonic(")
         offenders: list[str] = []
@@ -305,7 +320,7 @@ class TestDomainPurity:
                     offenders.append(f"{path.name}: {needle}")
         assert offenders == [], f"pure domain code must not read a clock: {offenders}"
 
-    def test_strategy_and_backtest_use_no_randomness(self) -> None:
+    def test_pure_domain_uses_no_randomness(self) -> None:
         """Randomness arrives only in Phase 2.9, seeded, in its own module."""
         forbidden = ("import random", "from random", "import secrets", "numpy.random", "uuid4")
         offenders: list[str] = []
@@ -316,7 +331,7 @@ class TestDomainPurity:
                     offenders.append(f"{path.name}: {needle}")
         assert offenders == [], f"pure domain code must be deterministic: {offenders}"
 
-    def test_strategy_and_backtest_perform_no_io_and_read_no_environment(self) -> None:
+    def test_pure_domain_performs_no_io_and_reads_no_environment(self) -> None:
         forbidden = ("open(", "pathlib", "os.environ", "os.getenv", "requests", "app.config")
         offenders: list[str] = []
         for path in self._pure_sources():
