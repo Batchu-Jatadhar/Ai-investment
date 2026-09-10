@@ -388,3 +388,98 @@ class TestEntryCutoff:
             (*OPENING_BARS, too_late), context(prior_atr=Decimal("10"))
         )
         assert decision.reason is OrbReason.RANGE_TOO_WIDE
+
+
+#: The Monday after SESSION_OPEN's Friday. 2026-08-24 09:15 IST.
+NEXT_SESSION_OPEN = SESSION_OPEN + timedelta(days=3)
+
+
+def next_session_bar(index: int, *, high: str, low: str, close: str) -> Candle:
+    return make_candle(
+        NEXT_SESSION_OPEN + CandleInterval.M5.delta * index,
+        CandleInterval.M5,
+        open_="1400",
+        high=high,
+        low=low,
+        close=close,
+    )
+
+
+class TestOnePerDirectionPerSession:
+    """At most one long and one short per instrument per session.
+
+    Derived by rescanning the prefix, never remembered on the instance - which
+    is what makes a session's outcome independent of what was replayed before
+    it.
+    """
+
+    def test_a_second_long_breakout_in_the_same_session_is_rejected(self) -> None:
+        second = five_minute(4, high="1425", low="1414", close="1422")
+        decision = OrbStrategy().evaluate((*OPENING_BARS, LONG_BREAK, second), context())
+        assert decision == OrbDecision(None, OrbReason.DIRECTION_ALREADY_SIGNALLED)
+
+    def test_a_short_after_a_long_still_signals(self) -> None:
+        """The limit is per direction, not per session: a day that broke up and
+        then reversed through the range low is two distinct setups."""
+        reversal = five_minute(5, high="1400", low="1384", close="1385")
+        decision = OrbStrategy().evaluate((*OPENING_BARS, LONG_BREAK, reversal), context())
+
+        assert decision.reason is OrbReason.SHORT_BREAKOUT
+        assert decision.signal is not None
+        assert decision.signal.stop_price == Decimal("1412")
+
+    def test_a_second_short_is_rejected_too(self) -> None:
+        second = five_minute(5, high="1386", low="1370", close="1375")
+        decision = OrbStrategy().evaluate((*OPENING_BARS, SHORT_BREAK, second), context())
+        assert decision == OrbDecision(None, OrbReason.DIRECTION_ALREADY_SIGNALLED)
+
+    def test_a_rejected_setup_does_not_consume_the_direction(self) -> None:
+        """The first breakout never became a signal, so the day has not had its
+        trade. It reports the range problem again, not "already signalled"."""
+        opening = flat_opening(high="1400.10", low="1400.00", close="1400.05")
+        first = five_minute(3, high="1400.60", low="1400.05", close="1400.50")
+        second = five_minute(4, high="1400.90", low="1400.50", close="1400.80")
+
+        decision = OrbStrategy().evaluate((*opening, first, second), context())
+        assert decision == OrbDecision(None, OrbReason.RANGE_TOO_NARROW)
+
+    def test_the_next_session_signals_again_from_the_same_instance(self) -> None:
+        """Session reset, with nothing to reset.
+
+        The same strategy object decides a second session whose prefix contains
+        none of the first session's bars. A has_signalled flag on the instance
+        would have carried over and silenced this day.
+        """
+        strategy = OrbStrategy()
+        first_day = strategy.evaluate((*OPENING_BARS, LONG_BREAK), context())
+        assert first_day.reason is OrbReason.LONG_BREAKOUT
+
+        monday_opening = (
+            next_session_bar(0, high="1405", low="1398", close="1400"),
+            next_session_bar(1, high="1402", low="1390", close="1395"),
+            next_session_bar(2, high="1412", low="1400", close="1410"),
+        )
+        monday_break = next_session_bar(3, high="1418", low="1409", close="1416")
+        monday = strategy.evaluate(
+            (*monday_opening, monday_break),
+            context(
+                session_open=NEXT_SESSION_OPEN,
+                session_close=NEXT_SESSION_OPEN + timedelta(hours=6, minutes=15),
+            ),
+        )
+
+        assert monday.reason is OrbReason.LONG_BREAKOUT
+        assert monday.signal is not None
+        assert monday.signal.signal_bar_start == monday_break.start_at
+
+    def test_the_order_sessions_are_replayed_in_does_not_matter(self) -> None:
+        """Deciding the same prefix before and after an unrelated session must
+        give the same answer - the property a mutable flag would destroy."""
+        strategy = OrbStrategy()
+        prefix = (*OPENING_BARS, LONG_BREAK, five_minute(4, high="1425", low="1414", close="1422"))
+
+        alone = strategy.evaluate(prefix, context())
+        strategy.evaluate((*OPENING_BARS, SHORT_BREAK), context())
+        after = strategy.evaluate(prefix, context())
+
+        assert after == alone == OrbDecision(None, OrbReason.DIRECTION_ALREADY_SIGNALLED)

@@ -107,6 +107,7 @@ class OrbReason(StrEnum):
     RANGE_TOO_WIDE = "RANGE_TOO_WIDE"
     ATR_UNAVAILABLE = "ATR_UNAVAILABLE"
     ENTRY_CUTOFF_REACHED = "ENTRY_CUTOFF_REACHED"
+    DIRECTION_ALREADY_SIGNALLED = "DIRECTION_ALREADY_SIGNALLED"
 
     @classmethod
     def for_direction(cls, direction: SignalDirection) -> OrbReason:
@@ -197,6 +198,9 @@ class OrbStrategy:
         if direction is None:
             return OrbDecision(None, OrbReason.NO_BREAKOUT)
 
+        if self._already_signalled(session_bars, measured, direction, context):
+            return OrbDecision(None, OrbReason.DIRECTION_ALREADY_SIGNALLED)
+
         rejection = self._rejection(current, measured, context)
         if rejection is not None:
             return OrbDecision(None, rejection)
@@ -205,6 +209,42 @@ class OrbStrategy:
             self._signal(current, measured, direction, context),
             OrbReason.for_direction(direction),
         )
+
+    def _already_signalled(
+        self,
+        session_bars: Sequence[Candle],
+        measured: OpeningRange,
+        direction: SignalDirection,
+        context: StrategyContext,
+    ) -> bool:
+        """Has an earlier bar of this session already fired in ``direction``?
+
+        **Derived from the prefix, never remembered.** A ``has_signalled_long``
+        flag on the instance would be the obvious implementation and is exactly
+        what makes a run irreproducible: the answer would depend on which
+        sessions had been replayed through this object beforehand, so replaying
+        one session alone would give a different result than replaying it inside
+        a year. Re-deriving costs a rescan and buys the guarantee that a session
+        decides its own outcome.
+
+        Session reset falls out of this for free. A new session arrives as a new
+        prefix containing none of yesterday's bars, so there is nothing to
+        forget and no boundary at which forgetting could be missed.
+
+        A rejected setup does not consume the direction. It never became a
+        signal, so the day has not had its trade, which is why the rejection
+        check is repeated here rather than assumed.
+
+        ponytail: rescans the prefix per bar, so a session costs O(n^2) - about
+        2,800 comparisons for a 75-bar day, which is free. Memoise per session
+        if an interval far finer than 1m ever makes it matter.
+        """
+        for earlier in session_bars[:-1]:
+            if breakout_direction(earlier, measured) is not direction:
+                continue
+            if self._rejection(earlier, measured, context) is None:
+                return True
+        return False
 
     def _rejection(
         self, candle: Candle, measured: OpeningRange, context: StrategyContext
