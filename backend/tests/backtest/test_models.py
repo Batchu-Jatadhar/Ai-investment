@@ -75,7 +75,7 @@ def make_signal() -> Signal:
         instrument_token=RELIANCE_TOKEN,
         direction=SignalDirection.LONG,
         stop_price=Decimal("1395.00"),
-        target_price=Decimal("1415.00"),
+        target_r_multiple=Decimal("2"),
         signal_bar_start=SESSION_OPEN,
         reason="close above opening range high",
     )

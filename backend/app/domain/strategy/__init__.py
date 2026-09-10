@@ -6,9 +6,14 @@ Implemented in Phase 2.0:
   * ``StrategyContext``, holding only what is knowable at decision time
   * ``OrbParams``, the Opening Range Breakout INITIAL FIXED HYPOTHESIS
 
+Refined in Phase 2.2 so the ORB can be expressed without bending the contract:
+a signal states its target as an R multiple rather than a price, since the entry
+it would be measured from does not exist yet, and the context carries the prior
+sessions' ATR, which is knowable at the opening bell but unreachable from bars
+the strategy is handed.
+
 Still to come:
-  * ATR and opening-range features (Phase 2.1)
-  * the Opening Range Breakout strategy itself (Phase 2.2)
+  * the Opening Range Breakout strategy itself
   * signal deduplication, conflict resolution and ranking, if a second strategy
     ever makes them necessary
 

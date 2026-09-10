@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from app.core.time import NaiveDatetimeError
+from app.core.time import NaiveDatetimeError, to_ist
 from app.domain.market.session import MarketSessionCalendar
 from app.domain.strategy.contract import (
     Signal,
@@ -16,6 +16,7 @@ from app.domain.strategy.contract import (
     Strategy,
     StrategyContext,
 )
+from app.domain.strategy.params import OrbParams
 from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_OPEN, make_instrument
 
 
@@ -24,7 +25,7 @@ def long_signal(**overrides: object) -> Signal:
         "instrument_token": RELIANCE_TOKEN,
         "direction": SignalDirection.LONG,
         "stop_price": Decimal("1395.00"),
-        "target_price": Decimal("1415.00"),
+        "target_r_multiple": Decimal("2"),
         "signal_bar_start": SESSION_OPEN,
         "reason": "close above opening range high",
     }
@@ -39,6 +40,10 @@ class TestSignalShape:
     #: (Phase 3); entry price is discovered by the execution simulator, because
     #: when a signal fires nobody knows the next bar's open; order identifiers
     #: and portfolio state belong to layers the strategy cannot see.
+    #:
+    #: ``target_price`` is on the list for a subtler reason: an absolute target
+    #: is R measured from an entry, so naming one would smuggle in an assumed
+    #: entry price that stop and target together would make recoverable.
     FORBIDDEN = (
         "quantity",
         "qty",
@@ -47,6 +52,7 @@ class TestSignalShape:
         "entry_price",
         "entry",
         "fill_price",
+        "target_price",
         "order_id",
         "order_type",
         "broker_order_id",
@@ -66,7 +72,7 @@ class TestSignalShape:
             "instrument_token",
             "direction",
             "stop_price",
-            "target_price",
+            "target_r_multiple",
             "signal_bar_start",
             "reason",
         }
@@ -77,7 +83,7 @@ class TestSignalShape:
                 instrument_token=RELIANCE_TOKEN,
                 direction=SignalDirection.LONG,
                 stop_price=Decimal("1395.00"),
-                target_price=Decimal("1415.00"),
+                target_r_multiple=Decimal("2"),
                 signal_bar_start=SESSION_OPEN,
                 reason="x",
                 quantity=10,
@@ -89,7 +95,7 @@ class TestSignalShape:
                 instrument_token=RELIANCE_TOKEN,
                 direction=SignalDirection.LONG,
                 stop_price=Decimal("1395.00"),
-                target_price=Decimal("1415.00"),
+                target_r_multiple=Decimal("2"),
                 signal_bar_start=SESSION_OPEN,
                 reason="x",
                 entry_price=Decimal("1400.00"),
@@ -106,24 +112,28 @@ class TestSignalValidation:
         assert long_signal().direction is SignalDirection.LONG
 
     def test_a_valid_short_signal_is_accepted(self) -> None:
+        """A short's stop sits above the range, and its target is the same 2R.
+
+        The R multiple is direction-free, which is the point: the same ``2``
+        means "twice the distance to the stop" whichever way the trade points,
+        and the execution simulator applies the sign once it knows the entry.
+        """
         signal = long_signal(
             direction=SignalDirection.SHORT,
             stop_price=Decimal("1415.00"),
-            target_price=Decimal("1395.00"),
         )
         assert signal.direction is SignalDirection.SHORT
+        assert signal.target_r_multiple == Decimal("2")
 
-    def test_long_target_below_stop_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match="must be above its"):
-            long_signal(stop_price=Decimal("1415.00"), target_price=Decimal("1395.00"))
+    @pytest.mark.parametrize("multiple", [Decimal("0"), Decimal("-2")])
+    def test_a_non_positive_target_multiple_is_rejected(self, multiple: Decimal) -> None:
+        """A target at or behind the entry is not a target."""
+        with pytest.raises(ValueError, match="target_r_multiple must be positive"):
+            long_signal(target_r_multiple=multiple)
 
-    def test_short_target_above_stop_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match="must be below its"):
-            long_signal(
-                direction=SignalDirection.SHORT,
-                stop_price=Decimal("1395.00"),
-                target_price=Decimal("1415.00"),
-            )
+    def test_a_float_target_multiple_is_rejected(self) -> None:
+        with pytest.raises(TypeError, match="never float"):
+            long_signal(target_r_multiple=2.0)
 
     def test_naive_signal_timestamp_is_rejected(self) -> None:
         with pytest.raises(NaiveDatetimeError):
@@ -160,6 +170,7 @@ class TestStrategyContext:
             "calendar": MarketSessionCalendar.nse_equity(),
             "session_open": SESSION_OPEN,
             "session_close": SESSION_OPEN + timedelta(hours=6, minutes=15),
+            "prior_atr": Decimal("12.50"),
         }
         values.update(overrides)
         return StrategyContext(**values)  # type: ignore[arg-type]
@@ -195,7 +206,38 @@ class TestStrategyContext:
         }
         names = {f.name for f in dataclasses.fields(StrategyContext)}
         assert names & forbidden == set()
-        assert names == {"instrument", "calendar", "session_open", "session_close"}
+        assert names == {
+            "instrument",
+            "calendar",
+            "session_open",
+            "session_close",
+            "prior_atr",
+        }
+
+    def test_prior_atr_is_optional_because_history_may_be_too_short(self) -> None:
+        """None, not zero: a strategy that needs it must decline, not substitute."""
+        assert self.make(prior_atr=None).prior_atr is None
+
+    @pytest.mark.parametrize("value", [Decimal("0"), Decimal("-1")])
+    def test_a_non_positive_prior_atr_is_rejected(self, value: Decimal) -> None:
+        with pytest.raises(ValueError, match="prior_atr must be positive"):
+            self.make(prior_atr=value)
+
+    def test_a_float_prior_atr_is_rejected(self) -> None:
+        with pytest.raises(TypeError, match="never float"):
+            self.make(prior_atr=12.5)
+
+    def test_session_date_is_the_ist_date_of_the_open(self) -> None:
+        """03:45 UTC is 09:15 IST the same day - but the date must come from IST.
+
+        A session that opens at 09:15 IST on the 21st is 03:45 UTC on the 21st,
+        so this case agrees either way; the assertion is here because the
+        opening-range calculation is keyed on the IST date and reading the UTC
+        date would be a silent off-by-one on any session that straddled
+        midnight UTC.
+        """
+        assert self.make().session_date == date(2026, 8, 21)
+        assert self.make().session_date == to_ist(SESSION_OPEN).date()
 
 
 class TestStrategyProtocol:
@@ -208,6 +250,58 @@ class TestStrategyProtocol:
                 return None
 
         assert isinstance(PureStrategy(), Strategy)
+
+    def test_a_strategy_may_hold_immutable_configuration(self) -> None:
+        """Frozen params on the instance are configuration, not state.
+
+        This is how parameters reach a strategy. Putting them on the context
+        instead would make one shared contract carry one strategy's settings,
+        and every other strategy would inherit fields meaningless to it.
+        """
+
+        class ConfiguredStrategy:
+            name = "orb"
+            version = "1"
+
+            def __init__(self, params: OrbParams) -> None:
+                self.params = params
+
+            def on_bar(self, session_bars, context):  # noqa: ANN001, ANN202
+                return None
+
+        strategy = ConfiguredStrategy(OrbParams())
+        assert isinstance(strategy, Strategy)
+        assert strategy.params.target_r_multiple == Decimal("2.0")
+
+    def test_the_same_inputs_produce_the_same_signal(self) -> None:
+        """Determinism is the contract's whole point, and Signal equality is
+        what makes it checkable: two frozen dataclasses with equal fields are
+        equal, so a replay that drifted would compare unequal."""
+
+        class EchoStrategy:
+            name = "echo"
+            version = "1"
+
+            def on_bar(self, session_bars, context):  # noqa: ANN001, ANN202
+                return Signal(
+                    instrument_token=context.instrument.instrument_token,
+                    direction=SignalDirection.LONG,
+                    stop_price=Decimal("1395.00"),
+                    target_r_multiple=Decimal("2"),
+                    signal_bar_start=session_bars[-1],
+                    reason="echo",
+                )
+
+        strategy = EchoStrategy()
+        context = StrategyContext(
+            instrument=make_instrument(),
+            calendar=MarketSessionCalendar.nse_equity(),
+            session_open=SESSION_OPEN,
+            session_close=SESSION_OPEN + timedelta(hours=6, minutes=15),
+        )
+        first = strategy.on_bar([SESSION_OPEN], context)
+        second = strategy.on_bar([SESSION_OPEN], context)
+        assert first == second
 
     def test_an_object_without_on_bar_does_not_satisfy_it(self) -> None:
         class NotAStrategy:
