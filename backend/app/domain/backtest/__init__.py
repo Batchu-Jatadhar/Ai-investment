@@ -17,7 +17,13 @@ conflated with this simulation.
 """
 
 from app.domain.backtest.cash import CashLedger, build_equity_curve
-from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
+from app.domain.backtest.config import (
+    NSE_INTRADAY_EQUITY,
+    CostSchedule,
+    ExecutionConfig,
+    SlippageConfig,
+)
+from app.domain.backtest.costs import LegCharges, leg_charges
 from app.domain.backtest.execution import (
     EntryOutcome,
     ExecutionIntent,
@@ -47,6 +53,7 @@ from app.domain.backtest.position import Position, PositionBook, PositionTransit
 from app.domain.backtest.sizing import PositionSizeError, fixed_notional_quantity
 
 __all__ = [
+    "NSE_INTRADAY_EQUITY",
     "AmbiguityResolution",
     "BacktestInput",
     "BacktestResult",
@@ -54,6 +61,7 @@ __all__ = [
     "CostSchedule",
     "EntryOutcome",
     "EquityPoint",
+    "LegCharges",
     "ExecutionConfig",
     "ExecutionIntent",
     "ExecutionStatus",
@@ -74,6 +82,7 @@ __all__ = [
     "UnexecutableBarError",
     "build_equity_curve",
     "fixed_notional_quantity",
+    "leg_charges",
     "resolve_entry_fill",
     "resolve_exit_fill",
     "resolve_hard_exit_fill",
