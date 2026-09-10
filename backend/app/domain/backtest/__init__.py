@@ -42,6 +42,7 @@ from app.domain.backtest.models import (
     Trade,
 )
 from app.domain.backtest.position import Position, PositionBook, PositionTransitionError
+from app.domain.backtest.sizing import PositionSizeError, fixed_notional_quantity
 
 __all__ = [
     "AmbiguityResolution",
@@ -60,12 +61,14 @@ __all__ = [
     "OrderSide",
     "Position",
     "PositionBook",
+    "PositionSizeError",
     "PositionTransitionError",
     "RunManifest",
     "SignalRecord",
     "SlippageConfig",
     "Trade",
     "UnexecutableBarError",
+    "fixed_notional_quantity",
     "resolve_entry_fill",
     "resolve_exit_fill",
     "resolve_hard_exit_fill",
