@@ -25,6 +25,7 @@ from app.domain.backtest.execution import (
     UnexecutableBarError,
     resolve_entry_fill,
     resolve_exit_fill,
+    resolve_hard_exit_fill,
     resolve_stop_fill,
     resolve_target_fill,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "UnexecutableBarError",
     "resolve_entry_fill",
     "resolve_exit_fill",
+    "resolve_hard_exit_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
 ]

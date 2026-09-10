@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime, timedelta
+import pathlib
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
 
-from app.core.time import NaiveDatetimeError
+from app.core.time import NaiveDatetimeError, ensure_utc, ist_datetime
 from app.domain.backtest.config import ExecutionConfig, SlippageConfig
 from app.domain.backtest.execution import (
     EntryOutcome,
@@ -18,6 +19,7 @@ from app.domain.backtest.execution import (
     UnexecutableBarError,
     resolve_entry_fill,
     resolve_exit_fill,
+    resolve_hard_exit_fill,
     resolve_stop_fill,
     resolve_target_fill,
 )
@@ -25,7 +27,12 @@ from app.domain.backtest.models import AmbiguityResolution, Fill, FillReason, Or
 from app.domain.market.models import CandleInterval, CandleStatus
 from app.domain.market.ports import DataGap
 from app.domain.strategy.contract import Signal, SignalDirection
-from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_OPEN, make_candle
+from tests.backtest.conftest import (
+    RELIANCE_TOKEN,
+    SESSION_DATE,
+    SESSION_OPEN,
+    make_candle,
+)
 
 #: The signal fires on the 09:15 bar; the entry lands on the 09:20 bar.
 NEXT_BAR = SESSION_OPEN + timedelta(minutes=5)
@@ -927,3 +934,183 @@ class TestResolutionCannotMisreportItself:
     def test_recording_a_tier_without_a_fill_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="nothing to resolve"):
             ExitResolution(None, AmbiguityResolution.RESOLVED_BY_1M)
+
+
+# --------------------------------------------------------------------------- #
+# Hard exit at the 15:15 IST cutoff
+# --------------------------------------------------------------------------- #
+
+HARD_EXIT = time(15, 15)
+
+
+def bar_closing_at(hour: int, minute_of_hour: int, **prices: str):  # noqa: ANN201
+    """A 5m bar whose close lands on the given IST wall-clock time."""
+    end = ensure_utc(ist_datetime(SESSION_DATE, time(hour, minute_of_hour)))
+    values: dict[str, str] = {
+        "open_": "1400",
+        "high": "1405",
+        "low": "1396",
+        "close": "1402",
+    }
+    values.update(prices)
+    return make_candle(end - CandleInterval.M5.delta, CandleInterval.M5, **values)  # type: ignore[arg-type]
+
+
+def hard_exit(intent, bar, slippage=ONE_TICK):  # noqa: ANN001, ANN201
+    return resolve_hard_exit_fill(
+        intent, bar, hard_exit_time=HARD_EXIT, tick_size=TICK, slippage=slippage
+    )
+
+
+class TestHardExit:
+    def test_a_position_open_at_the_cutoff_is_flattened(self) -> None:
+        """The 15:10-15:15 bar is the first whose close reaches the deadline,
+        and its closing price is the last one actually transacted by then."""
+        bar = bar_closing_at(15, 15, close="1402")
+        fill = hard_exit(make_intent(), bar)
+
+        assert fill is not None
+        assert fill.reason is FillReason.TIME_EXIT
+        assert fill.side is OrderSide.SELL
+        assert fill.quantity == 70
+        assert fill.reference_price == Decimal("1402")
+        assert fill.price == Decimal("1401.95")
+        assert fill.occurred_at == bar.end_at
+
+    def test_a_short_is_bought_back_at_the_cutoff(self) -> None:
+        bar = bar_closing_at(15, 15, close="1402")
+        fill = hard_exit(short_intent(), bar)
+
+        assert fill is not None
+        assert fill.side is OrderSide.BUY
+        assert fill.price == Decimal("1402.05")
+
+    def test_a_bar_closing_before_the_cutoff_does_not_flatten(self) -> None:
+        assert hard_exit(make_intent(), bar_closing_at(15, 10)) is None
+        assert hard_exit(make_intent(), bar_closing_at(12, 0)) is None
+
+    def test_a_position_that_survived_past_the_cutoff_is_still_flattened(self) -> None:
+        """The rule is "not open after 15:15", not "only checked at 15:15"."""
+        fill = hard_exit(make_intent(), bar_closing_at(15, 20))
+        assert fill is not None
+        assert fill.reason is FillReason.TIME_EXIT
+
+    def test_slippage_is_adverse(self) -> None:
+        bar = bar_closing_at(15, 15, close="1402")
+        assert hard_exit(make_intent(), bar, THREE_TICKS).price == Decimal("1401.85")
+        assert hard_exit(short_intent(), bar, THREE_TICKS).price == Decimal("1402.15")
+
+    def test_an_unusable_bar_at_the_cutoff_is_refused_rather_than_priced(self) -> None:
+        bar = dataclasses.replace(bar_closing_at(15, 15), volume=0)
+        with pytest.raises(UnexecutableBarError):
+            hard_exit(make_intent(), bar)
+
+
+class TestNoExitBeyondTheSession:
+    def test_a_bar_from_a_later_session_is_rejected(self) -> None:
+        """Surviving into another session is a sequencing bug, not an overnight
+        hold this engine models."""
+        tomorrow = make_candle(
+            ensure_utc(ist_datetime(SESSION_DATE, time(15, 10))) + timedelta(days=3),
+            CandleInterval.M5,
+            open_="1400",
+            high="1405",
+            low="1396",
+            close="1402",
+        )
+        with pytest.raises(ValueError, match="later session"):
+            hard_exit(make_intent(), tomorrow)
+
+    def test_a_bar_before_the_entry_is_rejected(self) -> None:
+        early = make_candle(
+            SESSION_OPEN,
+            CandleInterval.M5,
+            open_="1400",
+            high="1405",
+            low="1396",
+            close="1402",
+        )
+        with pytest.raises(ValueError, match="no position to flatten yet"):
+            hard_exit(make_intent(), early)
+
+
+class TestAlreadyClosedPositionsGetNoExtraExit:
+    def test_an_earlier_stop_means_the_cutoff_is_never_reached(self) -> None:
+        """Walked the way an engine walks: stop at the first exit. A position
+        closed at 11:00 never sees the 15:10 bar, so exactly one fill exists."""
+        session = (
+            bar_closing_at(10, 0),
+            bar_closing_at(11, 0, low="1385", close="1388"),
+            bar_closing_at(14, 0),
+            bar_closing_at(15, 15, close="1402"),
+        )
+        intent = make_intent()
+
+        fills = []
+        for bar in session:
+            exit_now = stop_fill(intent, bar) or hard_exit(intent, bar)
+            if exit_now is not None:
+                fills.append(exit_now)
+                break
+
+        assert len(fills) == 1
+        assert fills[0].reason is FillReason.STOP
+        assert fills[0].bar_start == session[1].start_at
+
+    def test_without_an_earlier_exit_the_cutoff_closes_it(self) -> None:
+        """The same walk, with nothing hitting the stop, ends in a time exit."""
+        session = (
+            bar_closing_at(10, 0),
+            bar_closing_at(11, 0),
+            bar_closing_at(14, 0),
+            bar_closing_at(15, 15, close="1402"),
+        )
+        intent = make_intent()
+
+        fills = []
+        for bar in session:
+            exit_now = stop_fill(intent, bar) or hard_exit(intent, bar)
+            if exit_now is not None:
+                fills.append(exit_now)
+                break
+
+        assert len(fills) == 1
+        assert fills[0].reason is FillReason.TIME_EXIT
+
+
+class TestHardExitIsDeterministic:
+    def test_the_same_bar_always_resolves_the_same_way(self) -> None:
+        bar = bar_closing_at(15, 15, close="1402")
+        assert hard_exit(make_intent(), bar) == hard_exit(make_intent(), bar)
+
+    def test_the_cutoff_is_read_from_the_bar_not_from_a_clock(self) -> None:
+        """A run over old data must give the same answer whenever it is run.
+
+        The module-wide guarantee is enforced by the architecture purity scans;
+        this asserts it at the point a reader of these tests will look for it.
+        """
+        source = (
+            pathlib.Path(resolve_hard_exit_fill.__module__.replace(".", "/") + ".py")
+            .resolve()
+            .read_text(encoding="utf-8")
+        )
+        for forbidden in ("datetime.now(", "utc_now(", "SystemClock", "time.time("):
+            assert forbidden not in source
+
+    def test_the_cutoff_itself_is_a_parameter(self) -> None:
+        """Passed in rather than read from the strategy, so this stays an
+        execution rule that a parameter configures."""
+        bar = bar_closing_at(14, 50, close="1402")
+
+        assert (
+            resolve_hard_exit_fill(
+                make_intent(), bar, hard_exit_time=HARD_EXIT, tick_size=TICK, slippage=ONE_TICK
+            )
+            is None
+        )
+        assert (
+            resolve_hard_exit_fill(
+                make_intent(), bar, hard_exit_time=time(14, 30), tick_size=TICK, slippage=ONE_TICK
+            )
+            is not None
+        )

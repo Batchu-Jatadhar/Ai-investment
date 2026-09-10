@@ -99,17 +99,29 @@ A minute in which *both* levels are reached is ambiguous at 1-minute resolution
 too. It takes the stop, and it records ``PESSIMISTIC_FALLBACK`` rather than
 ``RESOLVED_BY_1M`` - the minute data was read but did not decide, and the label
 names what actually decided.
+
+.. rubric:: The hard exit
+
+:func:`resolve_hard_exit_fill` flattens whatever is still open at the hypothesis'
+cutoff, 15:15 IST. It lives here and not in the strategy on purpose: the
+strategy proposes entries and the levels that invalidate them, and a
+"hard exit signal" would be a strategy inventing an exit it has no business
+owning. Being flat before the closing auction is a property of how this engine
+trades, not of what the ORB believes about price.
+
+The cutoff is read from the bar's own timestamp, never from a clock. That is
+what makes a run over 2019 data produce the same answer in 2026.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from decimal import Decimal
 from enum import StrEnum
 
-from app.core.time import ensure_utc
+from app.core.time import ensure_utc, to_ist
 from app.domain.backtest.config import ExecutionConfig, SlippageConfig
 from app.domain.backtest.models import AmbiguityResolution, Fill, FillReason, OrderSide
 from app.domain.market.models import Candle, CandleInterval, CandleStatus
@@ -124,6 +136,7 @@ __all__ = [
     "UnexecutableBarError",
     "resolve_entry_fill",
     "resolve_exit_fill",
+    "resolve_hard_exit_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
 ]
@@ -641,3 +654,75 @@ def resolve_exit_fill(
             return ExitResolution(target, AmbiguityResolution.RESOLVED_BY_1M)
 
     return ExitResolution(stop, AmbiguityResolution.PESSIMISTIC_FALLBACK)
+
+
+def resolve_hard_exit_fill(
+    intent: ExecutionIntent,
+    bar: Candle,
+    *,
+    hard_exit_time: time,
+    tick_size: Decimal,
+    slippage: SlippageConfig,
+    gaps: Sequence[DataGap] = (),
+) -> Fill | None:
+    """Flatten an open position at the cutoff, or ``None`` if it is not due yet.
+
+    ``hard_exit_time`` is an **IST wall-clock time**, naive by design, following
+    the same convention as ``OrbParams.hard_exit_time`` and the session window:
+    IST for session logic, UTC for storage. It is passed in rather than read
+    from the strategy's parameters, so this stays an execution rule that a
+    parameter happens to configure rather than a dependency on one strategy.
+
+    The exit is taken on the first bar whose **close** reaches the cutoff - the
+    15:10-15:15 bar for a 15:15 deadline - and at that bar's closing price. That
+    is the last price actually transacted at or before the deadline, and it is
+    always available, whereas waiting for the next bar's opening print would
+    need a bar that may not exist on the session's last one.
+
+    Whether the position is still open is the caller's to know. A position
+    closed earlier never reaches a bar at the cutoff, because the caller stops
+    walking at its first exit.
+
+    The decision comes entirely from ``bar``'s own timestamp. Nothing here reads
+    a clock, so the same bars give the same answer whenever the run happens.
+    """
+    if bar.status is not CandleStatus.COMPLETED:
+        raise ValueError(
+            f"the bar at {bar.start_at.isoformat()} is {bar.status.value}; a hard exit fills "
+            "at a settled closing price, and an in-progress bar has not got one"
+        )
+    if bar.start_at < intent.entry_bar_start:
+        raise ValueError(
+            f"the bar at {bar.start_at.isoformat()} precedes the entry bar "
+            f"({intent.entry_bar_start.isoformat()}); there is no position to flatten yet"
+        )
+    if to_ist(bar.start_at).date() != to_ist(intent.entry_bar_start).date():
+        raise ValueError(
+            f"the bar at {bar.start_at.isoformat()} belongs to a later session than the entry "
+            f"({intent.entry_bar_start.isoformat()}); the position should have been flattened "
+            "at its own session's cutoff, so surviving into another one is a sequencing bug "
+            "rather than an overnight hold this engine models"
+        )
+    if tick_size <= 0:
+        raise ValueError(f"tick_size must be positive, got {tick_size}")
+
+    if to_ist(bar.end_at).time() < hard_exit_time:
+        return None
+
+    _require_executable(bar, intent, gaps)
+
+    adverse = slippage.adverse_ticks * tick_size
+    reference = bar.close
+    price = reference - adverse if intent.direction.is_long else reference + adverse
+
+    return Fill(
+        side=intent.exit_side,
+        reason=FillReason.TIME_EXIT,
+        quantity=intent.quantity,
+        price=price,
+        reference_price=reference,
+        slippage_per_unit=adverse,
+        costs=Decimal(0),
+        occurred_at=bar.end_at,
+        bar_start=bar.start_at,
+    )
