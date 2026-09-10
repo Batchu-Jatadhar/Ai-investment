@@ -12,6 +12,10 @@ it would be measured from does not exist yet, and the context carries the prior
 sessions' ATR, which is knowable at the opening bell but unreachable from bars
 the strategy is handed.
 
+Phase 2.2 also adds ``breakout_direction``: has a completed 5m bar closed
+beyond the opening range, and which way. Detection only - whether a breakout is
+worth trading, and what stop and target it implies, arrive with the strategy.
+
 Still to come:
   * the Opening Range Breakout strategy itself
   * signal deduplication, conflict resolution and ranking, if a second strategy
@@ -27,6 +31,7 @@ from app.domain.strategy.contract import (
     Strategy,
     StrategyContext,
 )
+from app.domain.strategy.orb import breakout_direction
 from app.domain.strategy.params import OrbParams
 
 __all__ = [
@@ -35,4 +40,5 @@ __all__ = [
     "SignalDirection",
     "Strategy",
     "StrategyContext",
+    "breakout_direction",
 ]
