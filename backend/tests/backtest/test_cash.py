@@ -12,9 +12,9 @@ from decimal import Decimal
 
 import pytest
 
-from app.domain.backtest.cash import CashLedger
+from app.domain.backtest.cash import CashLedger, build_equity_curve
 from app.domain.backtest.execution import ExecutionIntent
-from app.domain.backtest.models import Fill, FillReason, OrderSide, Trade
+from app.domain.backtest.models import EquityPoint, Fill, FillReason, OrderSide, Trade
 from app.domain.backtest.position import PositionBook
 from app.domain.strategy.contract import Signal, SignalDirection
 from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_OPEN
@@ -244,3 +244,160 @@ class TestLedgerShape:
             }
             == set()
         )
+
+
+# --------------------------------------------------------------------------- #
+# Equity curve
+# --------------------------------------------------------------------------- #
+
+
+def trade_closing_at(
+    minutes: int,
+    direction: SignalDirection = SignalDirection.LONG,
+    entry_price: str = "1400.00",
+    exit_price: str = "1420.00",
+) -> Trade:
+    """A completed trade whose exit lands ``minutes`` after the session opens."""
+    entry_side = OrderSide.BUY if direction.is_long else OrderSide.SELL
+    at = SESSION_OPEN + timedelta(minutes=minutes)
+
+    entry = Fill(
+        side=entry_side,
+        reason=FillReason.ENTRY,
+        quantity=QUANTITY,
+        price=Decimal(entry_price),
+        reference_price=Decimal(entry_price),
+        slippage_per_unit=Decimal("0"),
+        costs=Decimal("20.00"),
+        occurred_at=ENTRY_BAR,
+        bar_start=ENTRY_BAR,
+    )
+    exit_fill = Fill(
+        side=entry_side.opposite,
+        reason=FillReason.TARGET,
+        quantity=QUANTITY,
+        price=Decimal(exit_price),
+        reference_price=Decimal(exit_price),
+        slippage_per_unit=Decimal("0"),
+        costs=Decimal("25.00"),
+        occurred_at=at,
+        bar_start=at,
+    )
+    _, trade = PositionBook().enter(intent(direction), entry).close(exit_fill)
+    return trade
+
+
+def curve(*trades: Trade) -> tuple[EquityPoint, ...]:
+    return build_equity_curve(trades, starting_capital=CAPITAL, start_at=SESSION_OPEN)
+
+
+class TestCurveShape:
+    def test_a_run_with_no_trades_is_a_single_flat_point(self) -> None:
+        """Equity before the first trade is the money that was put in."""
+        points = curve()
+
+        assert len(points) == 1
+        assert points[0].at == SESSION_OPEN
+        assert points[0].equity == CAPITAL
+        assert points[0].cash == CAPITAL
+        assert points[0].position_value == Decimal("0")
+
+    def test_points_are_in_chronological_order(self) -> None:
+        points = curve(trade_closing_at(30), trade_closing_at(90), trade_closing_at(180))
+
+        stamps = [point.at for point in points]
+        assert stamps == sorted(stamps)
+        assert len(stamps) == 4
+        assert stamps[0] == SESSION_OPEN
+        assert stamps[-1] == SESSION_OPEN + timedelta(minutes=180)
+
+    def test_trades_out_of_order_are_rejected_rather_than_sorted(self) -> None:
+        """Out-of-order trades mean the engine produced them out of order, and
+        quietly re-sorting would hide that while still producing a plausible
+        curve."""
+        with pytest.raises(ValueError, match="before the previous point"):
+            curve(trade_closing_at(90), trade_closing_at(30))
+
+    def test_a_trade_closing_before_the_start_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="before the previous point"):
+            build_equity_curve(
+                (trade_closing_at(30),),
+                starting_capital=CAPITAL,
+                start_at=SESSION_OPEN + timedelta(minutes=60),
+            )
+
+
+class TestEquityMoves:
+    def test_a_profitable_trade_raises_equity(self) -> None:
+        """1400.00 gross less 45.00 of costs is 1355.00 kept."""
+        points = curve(trade_closing_at(30))
+
+        assert points[1].equity == CAPITAL + Decimal("1355.00")
+        assert points[1].equity > points[0].equity
+
+    def test_a_losing_trade_lowers_equity(self) -> None:
+        points = curve(trade_closing_at(30, exit_price="1390.00"))
+
+        assert points[1].equity == CAPITAL - Decimal("745.00")
+        assert points[1].equity < points[0].equity
+
+    def test_a_losing_short_lowers_equity(self) -> None:
+        points = curve(trade_closing_at(30, SignalDirection.SHORT, exit_price="1412.00"))
+        assert points[1].equity == CAPITAL - Decimal("885.00")
+
+    def test_several_trades_accumulate(self) -> None:
+        """+1355, -745, +1355 leaves +1965 on the starting capital, and every
+        point along the way is the running total rather than the last step."""
+        points = curve(
+            trade_closing_at(30),
+            trade_closing_at(90, exit_price="1390.00"),
+            trade_closing_at(180),
+        )
+
+        assert [point.equity - CAPITAL for point in points] == [
+            Decimal("0"),
+            Decimal("1355.00"),
+            Decimal("610.00"),
+            Decimal("1965.00"),
+        ]
+
+
+class TestNothingIsValued:
+    def test_every_point_holds_nothing(self) -> None:
+        """The curve samples only when the book is flat, so position_value is
+        zero as a matter of fact rather than as a valuation assumption. There is
+        no approved model for pricing a position that is still held, and this
+        milestone was told not to invent one."""
+        points = curve(trade_closing_at(30), trade_closing_at(90))
+
+        for point in points:
+            assert point.position_value == Decimal("0")
+            assert point.equity == point.cash
+
+    def test_the_curve_agrees_with_the_ledger(self) -> None:
+        """Cash is carried by CashLedger rather than recomputed, so the two can
+        never disagree about what a run is worth."""
+        trades = (trade_closing_at(30), trade_closing_at(90, exit_price="1390.00"))
+
+        ledger = CashLedger.funded(CAPITAL)
+        for trade in trades:
+            ledger = ledger.after_entry(trade.entry).after_exit(trade)
+
+        assert curve(*trades)[-1].equity == ledger.cash
+        assert curve(*trades)[-1].equity == CAPITAL + ledger.realized_net_pnl
+
+
+class TestDeterminism:
+    def test_the_same_trades_always_give_the_same_curve(self) -> None:
+        trades = (trade_closing_at(30), trade_closing_at(90, exit_price="1390.00"))
+        assert curve(*trades) == curve(*trades)
+
+    def test_timestamps_come_from_the_fills_not_a_clock(self) -> None:
+        """A run over old data must produce the same stamps whenever it runs."""
+        points = curve(trade_closing_at(45))
+        assert points[1].at == SESSION_OPEN + timedelta(minutes=45)
+        assert points[1].at.tzinfo is not None
+
+    def test_float_capital_is_rejected(self) -> None:
+        with pytest.raises(TypeError, match="never float"):
+            build_equity_curve((), starting_capital=500000.0, start_at=SESSION_OPEN)  # type: ignore[arg-type]

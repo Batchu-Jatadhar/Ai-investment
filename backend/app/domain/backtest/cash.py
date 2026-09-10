@@ -28,16 +28,42 @@ Deliberately absent: performance metrics, drawdown, and any mark to market. A
 ledger knows what was realized, never what an open position might currently be
 worth - that needs a price which is not part of the ledger, and conflating the
 two is how an unrealized number ends up reported as a result.
+
+.. rubric:: The equity curve
+
+:func:`build_equity_curve` turns a run's trades into a timestamped series of
+:class:`EquityPoint`.
+
+**It samples only when the book is flat**, and that is the whole design. There
+is no approved model for valuing a position that is still held - marking to the
+last close, to the bar's midpoint, or to the entry are three different curves
+from the same trades, and choosing between them is a decision this milestone
+was told not to invent. Sampling at realizations sidesteps it completely:
+between a trade closing and the next one opening nothing is held, so
+``position_value`` is zero as a matter of fact rather than as an assumption, and
+``equity`` is simply the cash.
+
+The cost is that the curve says nothing about what happened *inside* a trade,
+so an intra-trade excursion is invisible to it. That matters for drawdown, which
+is exactly why drawdown is not built on this yet: when it is, it will need an
+explicit valuation rule, and that rule should be chosen deliberately rather than
+inherited by accident from whatever this function happened to do.
+
+Timestamps come from the fills. Nothing here reads a clock, so the same trades
+always produce the same curve.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
-from app.domain.backtest.models import Fill, FillReason, OrderSide, Trade
+from app.core.time import ensure_utc
+from app.domain.backtest.models import EquityPoint, Fill, FillReason, OrderSide, Trade
 
-__all__ = ["CashLedger"]
+__all__ = ["CashLedger", "build_equity_curve"]
 
 
 def _cash_delta(fill: Fill) -> Decimal:
@@ -134,3 +160,66 @@ class CashLedger:
             realized_costs=self.realized_costs + trade.costs,
             closed_trades=self.closed_trades + 1,
         )
+
+
+#: A flat book holds nothing, so there is nothing to value.
+_NOTHING_HELD = Decimal(0)
+
+
+def build_equity_curve(
+    trades: Sequence[Trade],
+    *,
+    starting_capital: Decimal,
+    start_at: datetime,
+) -> tuple[EquityPoint, ...]:
+    """The equity series for ``trades``, oldest first.
+
+    The first point is the run's opening balance at ``start_at`` - supplied by
+    the caller from the data, typically the first session's open, because
+    nothing here may read a clock. Every later point is a trade closing, stamped
+    with the moment its exit filled.
+
+    ``trades`` must be in non-decreasing exit order. They are validated rather
+    than sorted: trades arriving out of order means the engine produced them out
+    of order, and quietly re-sorting would hide that while still producing a
+    plausible curve.
+
+    Cash is carried by :class:`CashLedger` rather than recomputed, so the curve
+    and the ledger can never disagree about what a run is worth. Both legs of
+    each trade are applied, because a round trip's cash effect is the entry and
+    the exit together.
+    """
+    if not isinstance(starting_capital, Decimal):
+        raise TypeError("starting_capital must be Decimal, never float")
+
+    ledger = CashLedger.funded(starting_capital)
+    at = ensure_utc(start_at)
+    points = [
+        EquityPoint(
+            at=at,
+            cash=ledger.cash,
+            position_value=_NOTHING_HELD,
+            equity=ledger.cash,
+        )
+    ]
+
+    for index, trade in enumerate(trades):
+        closed_at = ensure_utc(trade.exit.occurred_at)
+        if closed_at < at:
+            raise ValueError(
+                f"trade {index} closed at {closed_at.isoformat()}, before the previous point at "
+                f"{at.isoformat()}; an equity curve is a series in time and its inputs must "
+                "already be in the order they happened"
+            )
+        ledger = ledger.after_entry(trade.entry).after_exit(trade)
+        at = closed_at
+        points.append(
+            EquityPoint(
+                at=at,
+                cash=ledger.cash,
+                position_value=_NOTHING_HELD,
+                equity=ledger.cash,
+            )
+        )
+
+    return tuple(points)

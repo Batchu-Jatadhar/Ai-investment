@@ -16,7 +16,7 @@ broker, no ORM and no clock, and the architecture-purity tests enforce that.
 conflated with this simulation.
 """
 
-from app.domain.backtest.cash import CashLedger
+from app.domain.backtest.cash import CashLedger, build_equity_curve
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.backtest.execution import (
     EntryOutcome,
@@ -70,6 +70,7 @@ __all__ = [
     "SlippageConfig",
     "Trade",
     "UnexecutableBarError",
+    "build_equity_curve",
     "fixed_notional_quantity",
     "resolve_entry_fill",
     "resolve_exit_fill",
