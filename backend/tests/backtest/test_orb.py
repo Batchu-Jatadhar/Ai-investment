@@ -6,11 +6,12 @@ can be read off the numbers in the test itself.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
 
+from app.core.time import to_ist
 from app.domain.indicators import IndicatorError, OpeningRange, opening_range
 from app.domain.market.models import Candle, CandleInterval, CandleStatus
 from app.domain.market.session import MarketSessionCalendar
@@ -294,3 +295,96 @@ class TestDecisionConsistency:
         )
         with pytest.raises(ValueError, match="must not leave a tradable signal"):
             OrbDecision(signal, OrbReason.NO_BREAKOUT)
+
+
+def flat_opening(high: str, low: str, close: str) -> tuple[Candle, ...]:
+    """Three identical opening bars, so the range is exactly ``low``-``high``."""
+    return tuple(five_minute(index, high=high, low=low, close=close) for index in range(3))
+
+
+class TestRangeValidityFilters:
+    """The hypothesis' two range filters, and what happens without an ATR.
+
+    The instrument's tick size is 0.05, so the 4-tick floor is 0.20.
+    """
+
+    def test_a_range_narrower_than_four_ticks_is_rejected(self) -> None:
+        """A stop this tight sits inside the spread, where the exit is decided
+        by the book rather than by the setup failing."""
+        opening = flat_opening(high="1400.10", low="1400.00", close="1400.05")
+        breakout = five_minute(3, high="1400.60", low="1400.05", close="1400.50")
+
+        decision = OrbStrategy().evaluate((*opening, breakout), context())
+        assert decision == OrbDecision(None, OrbReason.RANGE_TOO_NARROW)
+
+    def test_a_range_of_exactly_four_ticks_is_accepted(self) -> None:
+        """The floor is inclusive - 0.20 is four ticks, not three and a bit."""
+        opening = flat_opening(high="1400.20", low="1400.00", close="1400.10")
+        breakout = five_minute(3, high="1400.60", low="1400.05", close="1400.50")
+
+        decision = OrbStrategy().evaluate((*opening, breakout), context())
+        assert decision.reason is OrbReason.LONG_BREAKOUT
+        assert decision.signal is not None
+        assert decision.signal.stop_price == Decimal("1400.00")
+
+    def test_a_range_wider_than_the_atr_ceiling_is_rejected(self) -> None:
+        """Width 22 against 1.5 x 10 = 15. A 2R target would sit further away
+        than the instrument usually travels in a day."""
+        decision = OrbStrategy().evaluate(
+            (*OPENING_BARS, LONG_BREAK), context(prior_atr=Decimal("10"))
+        )
+        assert decision == OrbDecision(None, OrbReason.RANGE_TOO_WIDE)
+
+    def test_a_range_exactly_on_the_atr_ceiling_is_accepted(self) -> None:
+        """Width 22 against 1.5 x 14.666... = 22. The ceiling is inclusive."""
+        atr = Decimal("22") / Decimal("1.5")
+        decision = OrbStrategy().evaluate((*OPENING_BARS, LONG_BREAK), context(prior_atr=atr))
+        assert decision.reason is OrbReason.LONG_BREAKOUT
+
+    def test_a_missing_atr_declines_rather_than_substituting_a_value(self) -> None:
+        """Without an ATR the ceiling cannot be evaluated, so the setup cannot
+        be cleared. Assuming one would silently trade the days the filter
+        exists to skip."""
+        decision = OrbStrategy().evaluate((*OPENING_BARS, LONG_BREAK), context(prior_atr=None))
+        assert decision == OrbDecision(None, OrbReason.ATR_UNAVAILABLE)
+
+    def test_filters_are_not_reported_on_a_bar_that_did_not_break_out(self) -> None:
+        """An unusable day reports its rejections at most once per breakout, not
+        once per quiet bar - a log where most entries are noise is unreadable."""
+        opening = flat_opening(high="1400.10", low="1400.00", close="1400.05")
+        quiet = five_minute(3, high="1400.09", low="1400.01", close="1400.05")
+
+        decision = OrbStrategy().evaluate((*opening, quiet), context())
+        assert decision == OrbDecision(None, OrbReason.NO_BREAKOUT)
+
+
+class TestEntryCutoff:
+    """No new entries after 14:45 IST.
+
+    The cutoff is about the entry, which happens on the bar *after* the signal,
+    so it is the signal bar's close that must land at or before 14:45. Bar 65
+    of the session runs 14:40-14:45; bar 66 runs 14:45-14:50.
+    """
+
+    def test_a_bar_closing_exactly_at_the_cutoff_still_signals(self) -> None:
+        last_allowed = five_minute(65, high="1418", low="1409", close="1416")
+        assert to_ist(last_allowed.end_at).time() == time(14, 45)
+
+        decision = OrbStrategy().evaluate((*OPENING_BARS, last_allowed), context())
+        assert decision.reason is OrbReason.LONG_BREAKOUT
+
+    def test_a_bar_closing_after_the_cutoff_is_rejected(self) -> None:
+        too_late = five_minute(66, high="1418", low="1409", close="1416")
+        assert to_ist(too_late.end_at).time() == time(14, 50)
+
+        decision = OrbStrategy().evaluate((*OPENING_BARS, too_late), context())
+        assert decision == OrbDecision(None, OrbReason.ENTRY_CUTOFF_REACHED)
+
+    def test_an_unusable_range_outranks_the_cutoff(self) -> None:
+        """Both are true of this bar. The range describes the whole session and
+        invalidated it from 09:30; the cutoff only says this bar came late."""
+        too_late = five_minute(66, high="1418", low="1409", close="1416")
+        decision = OrbStrategy().evaluate(
+            (*OPENING_BARS, too_late), context(prior_atr=Decimal("10"))
+        )
+        assert decision.reason is OrbReason.RANGE_TOO_WIDE

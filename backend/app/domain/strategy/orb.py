@@ -44,6 +44,7 @@ from datetime import timedelta
 from enum import StrEnum
 from typing import ClassVar
 
+from app.core.time import to_ist
 from app.domain.indicators import OpeningRange, opening_range
 from app.domain.market.models import Candle, CandleStatus
 from app.domain.strategy.contract import Signal, SignalDirection, StrategyContext
@@ -102,6 +103,10 @@ class OrbReason(StrEnum):
     SHORT_BREAKOUT = "SHORT_ORB_BREAKOUT"
     OPENING_RANGE_INCOMPLETE = "OPENING_RANGE_INCOMPLETE"
     NO_BREAKOUT = "NO_BREAKOUT"
+    RANGE_TOO_NARROW = "RANGE_TOO_NARROW"
+    RANGE_TOO_WIDE = "RANGE_TOO_WIDE"
+    ATR_UNAVAILABLE = "ATR_UNAVAILABLE"
+    ENTRY_CUTOFF_REACHED = "ENTRY_CUTOFF_REACHED"
 
     @classmethod
     def for_direction(cls, direction: SignalDirection) -> OrbReason:
@@ -192,10 +197,54 @@ class OrbStrategy:
         if direction is None:
             return OrbDecision(None, OrbReason.NO_BREAKOUT)
 
+        rejection = self._rejection(current, measured, context)
+        if rejection is not None:
+            return OrbDecision(None, rejection)
+
         return OrbDecision(
             self._signal(current, measured, direction, context),
             OrbReason.for_direction(direction),
         )
+
+    def _rejection(
+        self, candle: Candle, measured: OpeningRange, context: StrategyContext
+    ) -> OrbReason | None:
+        """Why this breakout must not be traded, or ``None`` to take it.
+
+        Checked only once a breakout has actually fired. Filtering earlier would
+        stamp a rejection on every quiet bar of every unusable day, and a log
+        where most entries are noise is a log nobody reads. Asked in this order
+        the reason is the most specific one true of the setup: the two range
+        checks describe the whole session and invalidate it from 09:30 onwards,
+        so they outrank the cutoff, which only says this particular bar came
+        too late.
+        """
+        params = self.params
+
+        minimum = params.min_range_ticks * context.instrument.tick_size
+        if measured.width < minimum:
+            # A range this tight puts the stop inside the spread, where the
+            # exit is decided by the book rather than by the setup failing.
+            return OrbReason.RANGE_TOO_NARROW
+
+        if context.prior_atr is None:
+            # The ceiling cannot be evaluated, so the setup cannot be cleared.
+            # Declining is the contract: substituting a value would silently
+            # trade the days the filter exists to skip.
+            return OrbReason.ATR_UNAVAILABLE
+
+        if measured.width > params.max_range_atr_multiple * context.prior_atr:
+            # A range this wide relative to normal movement puts a 2R target
+            # further away than the instrument usually travels in a day.
+            return OrbReason.RANGE_TOO_WIDE
+
+        if to_ist(candle.end_at).time() > params.no_new_entry_after:
+            # The cutoff is about the *entry*, which happens on the bar after
+            # this one - so it is this bar's close, not its open, that has to
+            # land at or before the cutoff.
+            return OrbReason.ENTRY_CUTOFF_REACHED
+
+        return None
 
     def _signal(
         self,
