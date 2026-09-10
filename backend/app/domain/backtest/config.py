@@ -17,6 +17,7 @@ from typing import ClassVar
 from app.core.canonical import canonical_decimal
 
 __all__ = [
+    "NO_COSTS",
     "NSE_INTRADAY_EQUITY",
     "CostSchedule",
     "ExecutionConfig",
@@ -227,6 +228,22 @@ class CostSchedule:
         }
         rendered.update({name: canonical_decimal(getattr(self, name)) for name in self.RATE_FIELDS})
         return rendered
+
+
+NO_COSTS = CostSchedule(
+    schedule_id="no-costs",
+    version="0",
+    effective_from=date(1970, 1, 1),
+)
+"""A schedule that charges nothing.
+
+Every rate is zero, so a run under it sees gross P&L as its net. That is the
+Phase 2.3/2.4 behaviour, kept as a named value rather than an implicit default:
+a free run is a legitimate thing to want when checking engine mechanics on
+synthetic bars, and it should be visible in the manifest that that is what was
+done. ``rates_verified`` is ``False`` for it, so no result produced under it can
+claim to have been costed.
+"""
 
 
 NSE_INTRADAY_EQUITY = CostSchedule(

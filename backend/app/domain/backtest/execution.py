@@ -73,6 +73,18 @@ backtest quietly reports a number it did not earn.
 The rule in one line: *the market saying no is a result, the data being unable
 to say is an error.*
 
+.. rubric:: Charges
+
+Every fill is born with its costs already on it. Each resolver takes a
+``cost_schedule`` and charges the leg it just produced, from that leg's own
+executed value - so the buy/sell asymmetry survives intact, and there is no
+window in which an uncharged fill exists for someone to forget about.
+
+The default is :data:`~app.domain.backtest.config.NO_COSTS`, which charges
+nothing and is the behaviour these resolvers had before. It is not a way to
+forget: ``BacktestInput.cost_schedule`` is a required field, so the engine
+necessarily holds a real schedule and passes it down.
+
 .. rubric:: When both exits are inside one bar
 
 A 5-minute bar that reached the stop *and* traded through the target says
@@ -122,7 +134,8 @@ from decimal import Decimal
 from enum import StrEnum
 
 from app.core.time import ensure_utc, to_ist
-from app.domain.backtest.config import ExecutionConfig, SlippageConfig
+from app.domain.backtest.config import NO_COSTS, CostSchedule, ExecutionConfig, SlippageConfig
+from app.domain.backtest.costs import leg_charges
 from app.domain.backtest.models import AmbiguityResolution, Fill, FillReason, OrderSide
 from app.domain.market.models import Candle, CandleInterval, CandleStatus
 from app.domain.market.ports import DataGap
@@ -266,6 +279,7 @@ def resolve_stop_fill(
     tick_size: Decimal,
     slippage: SlippageConfig,
     gaps: Sequence[DataGap] = (),
+    cost_schedule: CostSchedule = NO_COSTS,
 ) -> Fill | None:
     """The protective stop's fill on ``bar``, or ``None`` if it survived.
 
@@ -334,7 +348,7 @@ def resolve_stop_fill(
         price=price,
         reference_price=reference,
         slippage_per_unit=adverse,
-        costs=Decimal(0),
+        costs=_leg_cost(cost_schedule, intent.exit_side, price, intent.quantity),
         # A gap fill happened at the opening print, which is a time we know. A
         # touch happened somewhere inside the bar, and all we can honestly say
         # is that it had happened by the close. Intrabar timing is what the
@@ -353,6 +367,7 @@ def resolve_target_fill(
     execution: ExecutionConfig,
     slippage: SlippageConfig,
     gaps: Sequence[DataGap] = (),
+    cost_schedule: CostSchedule = NO_COSTS,
 ) -> Fill | None:
     """The target's fill on ``bar``, or ``None`` if it was not reached.
 
@@ -433,12 +448,22 @@ def resolve_target_fill(
         price=price,
         reference_price=target,
         slippage_per_unit=adverse,
-        costs=Decimal(0),
+        costs=_leg_cost(cost_schedule, intent.exit_side, price, intent.quantity),
         # The through-print happened somewhere inside the bar; all that can
         # honestly be said is that it had happened by the close.
         occurred_at=bar.end_at,
         bar_start=bar.start_at,
     )
+
+
+def _leg_cost(schedule: CostSchedule, side: OrderSide, price: Decimal, quantity: int) -> Decimal:
+    """Statutory charges on one leg, from the value actually transacted.
+
+    The turnover is the *fill* price times quantity, not the reference level:
+    slippage is part of what was paid, and charging the level would understate
+    the bill on every fill that slipped.
+    """
+    return leg_charges(schedule, side=side, turnover=price * Decimal(quantity)).total
 
 
 def _require_executable(bar: Candle, intent: ExecutionIntent, gaps: Sequence[DataGap]) -> None:
@@ -486,6 +511,7 @@ def resolve_entry_fill(
     tick_size: Decimal,
     slippage: SlippageConfig,
     gaps: Sequence[DataGap] = (),
+    cost_schedule: CostSchedule = NO_COSTS,
 ) -> EntryOutcome:
     """Enter at ``next_bar``'s opening price, or report why not.
 
@@ -529,7 +555,7 @@ def resolve_entry_fill(
             price=price,
             reference_price=reference,
             slippage_per_unit=adverse,
-            costs=Decimal(0),
+            costs=_leg_cost(cost_schedule, intent.entry_side, price, intent.quantity),
             occurred_at=next_bar.start_at,
             bar_start=next_bar.start_at,
         ),
@@ -596,6 +622,7 @@ def resolve_exit_fill(
     slippage: SlippageConfig,
     minute_bars: Sequence[Candle] = (),
     gaps: Sequence[DataGap] = (),
+    cost_schedule: CostSchedule = NO_COSTS,
 ) -> ExitResolution:
     """The exit taken on ``bar``, resolving a same-bar stop/target collision.
 
@@ -607,9 +634,23 @@ def resolve_exit_fill(
     window are consulted, so a later minute cannot reach back and change an
     earlier bar's outcome.
     """
-    stop = resolve_stop_fill(intent, bar, tick_size=tick_size, slippage=slippage, gaps=gaps)
+    stop = resolve_stop_fill(
+        intent,
+        bar,
+        tick_size=tick_size,
+        slippage=slippage,
+        gaps=gaps,
+        cost_schedule=cost_schedule,
+    )
     target = resolve_target_fill(
-        intent, entry, bar, tick_size=tick_size, execution=execution, slippage=slippage, gaps=gaps
+        intent,
+        entry,
+        bar,
+        tick_size=tick_size,
+        execution=execution,
+        slippage=slippage,
+        gaps=gaps,
+        cost_schedule=cost_schedule,
     )
 
     if stop is None and target is None:
@@ -664,6 +705,7 @@ def resolve_hard_exit_fill(
     tick_size: Decimal,
     slippage: SlippageConfig,
     gaps: Sequence[DataGap] = (),
+    cost_schedule: CostSchedule = NO_COSTS,
 ) -> Fill | None:
     """Flatten an open position at the cutoff, or ``None`` if it is not due yet.
 
@@ -722,7 +764,7 @@ def resolve_hard_exit_fill(
         price=price,
         reference_price=reference,
         slippage_per_unit=adverse,
-        costs=Decimal(0),
+        costs=_leg_cost(cost_schedule, intent.exit_side, price, intent.quantity),
         occurred_at=bar.end_at,
         bar_start=bar.start_at,
     )
