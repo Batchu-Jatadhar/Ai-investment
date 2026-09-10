@@ -37,6 +37,14 @@ from app.domain.backtest.execution import (
     resolve_target_fill,
 )
 from app.domain.backtest.input import BacktestInput, InvalidBacktestInputError
+from app.domain.backtest.metrics import (
+    PerformanceReport,
+    PortfolioMetrics,
+    RiskMetrics,
+    StatisticalMetrics,
+    TradeMetrics,
+    evaluate_performance,
+)
 from app.domain.backtest.models import (
     AmbiguityResolution,
     BacktestResult,
@@ -70,17 +78,23 @@ __all__ = [
     "FillReason",
     "InvalidBacktestInputError",
     "OrderSide",
+    "PerformanceReport",
     "Portfolio",
+    "PortfolioMetrics",
     "Position",
     "PositionBook",
     "PositionSizeError",
     "PositionTransitionError",
+    "RiskMetrics",
     "RunManifest",
     "SignalRecord",
     "SlippageConfig",
+    "StatisticalMetrics",
     "Trade",
+    "TradeMetrics",
     "UnexecutableBarError",
     "build_equity_curve",
+    "evaluate_performance",
     "fixed_notional_quantity",
     "leg_charges",
     "resolve_entry_fill",
