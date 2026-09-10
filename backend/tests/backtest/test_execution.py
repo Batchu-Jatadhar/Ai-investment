@@ -14,12 +14,14 @@ from app.domain.backtest.execution import (
     EntryOutcome,
     ExecutionIntent,
     ExecutionStatus,
+    ExitResolution,
     UnexecutableBarError,
     resolve_entry_fill,
+    resolve_exit_fill,
     resolve_stop_fill,
     resolve_target_fill,
 )
-from app.domain.backtest.models import Fill, FillReason, OrderSide
+from app.domain.backtest.models import AmbiguityResolution, Fill, FillReason, OrderSide
 from app.domain.market.models import CandleInterval, CandleStatus
 from app.domain.market.ports import DataGap
 from app.domain.strategy.contract import Signal, SignalDirection
@@ -712,3 +714,216 @@ class TestNothingIsManufacturedSilently:
                 resolve_entry_fill(make_intent(), bar, tick_size=TICK, slippage=ONE_TICK)
             statuses.add(caught.value.status)
         assert statuses == {ExecutionStatus.NO_VOLUME}
+
+
+# --------------------------------------------------------------------------- #
+# Same-bar stop/target ambiguity
+# --------------------------------------------------------------------------- #
+
+#: A 5m bar that reached the stop (low 1385 <= 1390) *and* traded through the
+#: target (high 1425 >= 1420.05). On its own it says nothing about the order,
+#: and the difference is -1R against +2R.
+AMBIGUOUS_BAR = position_bar(open_="1400", high="1425", low="1385", close="1410")
+
+
+def minute(index: int, *, open_: str, high: str, low: str, close: str, offset: int = 0):  # noqa: ANN201
+    """The ``index``-th 1m bar of the 5m window starting ``offset`` windows on."""
+    start = NEXT_BAR + CandleInterval.M5.delta * offset + CandleInterval.M1.delta * index
+    return make_candle(start, CandleInterval.M1, open_=open_, high=high, low=low, close=close)
+
+
+QUIET = {"open_": "1400", "high": "1402", "low": "1398", "close": "1400"}
+STOP_MINUTE = {"open_": "1400", "high": "1401", "low": "1385", "close": "1392"}
+TARGET_MINUTE = {"open_": "1400", "high": "1425", "low": "1399", "close": "1424"}
+BOTH_MINUTE = {"open_": "1400", "high": "1425", "low": "1385", "close": "1400"}
+
+#: Stop in minute 1, target not until minute 3.
+STOP_FIRST = (
+    minute(0, **QUIET),
+    minute(1, **STOP_MINUTE),
+    minute(2, **QUIET),
+    minute(3, **TARGET_MINUTE),
+    minute(4, **QUIET),
+)
+
+#: Target in minute 1, stop not until minute 3.
+TARGET_FIRST = (
+    minute(0, **QUIET),
+    minute(1, **TARGET_MINUTE),
+    minute(2, **QUIET),
+    minute(3, **STOP_MINUTE),
+    minute(4, **QUIET),
+)
+
+
+def exit_res(  # noqa: ANN201
+    intent,  # noqa: ANN001
+    bar,  # noqa: ANN001
+    minute_bars=(),  # noqa: ANN001
+    execution=THROUGH_ONE_TICK,  # noqa: ANN001
+    slippage=ONE_TICK,  # noqa: ANN001
+):
+    entry = entry_fill(OrderSide.BUY if intent.direction.is_long else OrderSide.SELL)
+    return resolve_exit_fill(
+        intent,
+        entry,
+        bar,
+        tick_size=TICK,
+        execution=execution,
+        slippage=slippage,
+        minute_bars=minute_bars,
+    )
+
+
+class TestUnambiguousBars:
+    """Nothing to resolve, so nothing is recorded as resolved."""
+
+    def test_only_the_stop_reached(self) -> None:
+        bar = position_bar(open_="1400", high="1405", low="1388", close="1395")
+        result = exit_res(make_intent(), bar, STOP_FIRST)
+
+        assert result.ambiguity is AmbiguityResolution.UNAMBIGUOUS
+        assert result.fill is not None
+        assert result.fill.reason is FillReason.STOP
+
+    def test_only_the_target_reached(self) -> None:
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        result = exit_res(make_intent(), bar, STOP_FIRST)
+
+        assert result.ambiguity is AmbiguityResolution.UNAMBIGUOUS
+        assert result.fill is not None
+        assert result.fill.reason is FillReason.TARGET
+
+    def test_neither_reached(self) -> None:
+        bar = position_bar(open_="1400", high="1405", low="1395", close="1402")
+        assert exit_res(make_intent(), bar, STOP_FIRST) == ExitResolution(None)
+
+
+class TestTierOneUsesTheMinuteBars:
+    def test_the_stop_coming_first_takes_the_stop(self) -> None:
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, STOP_FIRST)
+
+        assert result.ambiguity is AmbiguityResolution.RESOLVED_BY_1M
+        assert result.fill is not None
+        assert result.fill.reason is FillReason.STOP
+        assert result.fill.reference_price == LONG_STOP
+
+    def test_the_target_coming_first_takes_the_target(self) -> None:
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, TARGET_FIRST)
+
+        assert result.ambiguity is AmbiguityResolution.RESOLVED_BY_1M
+        assert result.fill is not None
+        assert result.fill.reason is FillReason.TARGET
+        assert result.fill.reference_price == LONG_TARGET
+
+    def test_the_fill_still_comes_from_the_five_minute_bar(self) -> None:
+        """The minute bars order the two events; they do not re-price them, so
+        the execution model is unchanged by this resolution."""
+        resolved = exit_res(make_intent(), AMBIGUOUS_BAR, STOP_FIRST).fill
+        direct = stop_fill(make_intent(), AMBIGUOUS_BAR)
+        assert resolved == direct
+
+
+class TestTierTwoAssumesTheStop:
+    def test_no_minute_data_falls_back_to_the_stop(self) -> None:
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, ())
+
+        assert result.ambiguity is AmbiguityResolution.PESSIMISTIC_FALLBACK
+        assert result.fill is not None
+        assert result.fill.reason is FillReason.STOP
+
+    def test_partial_minute_coverage_is_treated_as_none(self) -> None:
+        """The missing minute is exactly the one that might have held the
+        answer, and filling the hole from its neighbours would be inventing the
+        ordering rather than reading it."""
+        four_of_five = TARGET_FIRST[:4]
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, four_of_five)
+
+        assert result.ambiguity is AmbiguityResolution.PESSIMISTIC_FALLBACK
+        assert result.fill.reason is FillReason.STOP
+
+    def test_both_levels_inside_one_minute_falls_back(self) -> None:
+        """Ambiguous at 1m resolution too. The minute data was read but did not
+        decide, so the label names what actually decided."""
+        same_minute = (
+            minute(0, **QUIET),
+            minute(1, **BOTH_MINUTE),
+            minute(2, **QUIET),
+            minute(3, **QUIET),
+            minute(4, **QUIET),
+        )
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, same_minute)
+
+        assert result.ambiguity is AmbiguityResolution.PESSIMISTIC_FALLBACK
+        assert result.fill.reason is FillReason.STOP
+
+    def test_an_unusable_minute_degrades_rather_than_crashing(self) -> None:
+        """A minute that cannot answer is not evidence about the ordering."""
+        holed = (
+            minute(0, **QUIET),
+            dataclasses.replace(minute(1, **TARGET_MINUTE), volume=0),
+            minute(2, **QUIET),
+            minute(3, **STOP_MINUTE),
+            minute(4, **QUIET),
+        )
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, holed)
+
+        assert result.ambiguity is AmbiguityResolution.PESSIMISTIC_FALLBACK
+        assert result.fill.reason is FillReason.STOP
+
+    def test_the_target_is_never_assumed(self) -> None:
+        """Across every shape of ambiguous bar, with no minute data, the answer
+        is always the stop. An engine that guessed favourably here would turn
+        its worst data into its best results."""
+        shapes = (
+            AMBIGUOUS_BAR,
+            position_bar(open_="1380", high="1430", low="1375", close="1400"),
+            position_bar(open_="1421", high="1440", low="1389", close="1400"),
+        )
+        for bar in shapes:
+            result = exit_res(make_intent(), bar, ())
+            assert result.ambiguity is AmbiguityResolution.PESSIMISTIC_FALLBACK
+            assert result.fill.reason is FillReason.STOP
+
+
+class TestNoFutureMinuteData:
+    def test_minutes_from_a_later_window_cannot_change_the_answer(self) -> None:
+        """The caller may hand over a whole session. Only the minutes inside
+        this bar's own window are consulted."""
+        later = tuple(
+            minute(index, offset=1, **(STOP_MINUTE if index == 0 else QUIET)) for index in range(5)
+        )
+        with_future = exit_res(make_intent(), AMBIGUOUS_BAR, (*TARGET_FIRST, *later))
+        without = exit_res(make_intent(), AMBIGUOUS_BAR, TARGET_FIRST)
+
+        assert with_future == without
+        assert with_future.fill.reason is FillReason.TARGET
+
+    def test_a_later_window_alone_is_not_coverage(self) -> None:
+        """Minutes that do not lie inside the bar give no coverage at all, so
+        the resolution falls back rather than reading the wrong window."""
+        later = tuple(minute(index, offset=1, **QUIET) for index in range(5))
+        result = exit_res(make_intent(), AMBIGUOUS_BAR, later)
+        assert result.ambiguity is AmbiguityResolution.PESSIMISTIC_FALLBACK
+
+
+class TestResolutionIsDeterministic:
+    def test_the_same_inputs_always_resolve_the_same_way(self) -> None:
+        for minutes in ((), STOP_FIRST, TARGET_FIRST):
+            first = exit_res(make_intent(), AMBIGUOUS_BAR, minutes)
+            second = exit_res(make_intent(), AMBIGUOUS_BAR, minutes)
+            assert first == second
+
+    def test_the_minute_order_supplied_does_not_matter(self) -> None:
+        """They are sorted by time before the walk, so a caller that hands them
+        over shuffled gets the same answer as one that does not."""
+        shuffled = (STOP_FIRST[3], STOP_FIRST[0], STOP_FIRST[4], STOP_FIRST[1], STOP_FIRST[2])
+        assert exit_res(make_intent(), AMBIGUOUS_BAR, shuffled) == exit_res(
+            make_intent(), AMBIGUOUS_BAR, STOP_FIRST
+        )
+
+
+class TestResolutionCannotMisreportItself:
+    def test_recording_a_tier_without_a_fill_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="nothing to resolve"):
+            ExitResolution(None, AmbiguityResolution.RESOLVED_BY_1M)

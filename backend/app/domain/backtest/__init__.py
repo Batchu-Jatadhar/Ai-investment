@@ -21,8 +21,10 @@ from app.domain.backtest.execution import (
     EntryOutcome,
     ExecutionIntent,
     ExecutionStatus,
+    ExitResolution,
     UnexecutableBarError,
     resolve_entry_fill,
+    resolve_exit_fill,
     resolve_stop_fill,
     resolve_target_fill,
 )
@@ -49,6 +51,7 @@ __all__ = [
     "ExecutionConfig",
     "ExecutionIntent",
     "ExecutionStatus",
+    "ExitResolution",
     "Fill",
     "FillReason",
     "InvalidBacktestInputError",
@@ -59,6 +62,7 @@ __all__ = [
     "Trade",
     "UnexecutableBarError",
     "resolve_entry_fill",
+    "resolve_exit_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
 ]

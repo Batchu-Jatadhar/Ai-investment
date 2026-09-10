@@ -72,6 +72,33 @@ backtest quietly reports a number it did not earn.
 
 The rule in one line: *the market saying no is a result, the data being unable
 to say is an error.*
+
+.. rubric:: When both exits are inside one bar
+
+A 5-minute bar that reached the stop *and* traded through the target says
+nothing about which happened first, and the difference is the whole trade: one
+outcome is -1R, the other is +2R. :func:`resolve_exit_fill` decides it in two
+tiers, and records which tier decided.
+
+*   **Tier 1 - the minute bars.** The five completed 1-minute bars inside that
+    5-minute window are walked in order, and whichever level is reached first
+    wins. They are used *only to order the two events*; the fill itself is the
+    one the 5-minute bar already produced, so this resolves the ambiguity
+    without changing the execution model.
+*   **Tier 2 - assume the stop.** When the minute bars are missing, incomplete
+    or themselves unusable, the stop is taken. Never the target. An engine that
+    guessed favourably here would turn its worst data into its best results,
+    which is the most expensive way a backtest can lie.
+
+Both tiers are recorded as an
+:class:`~app.domain.backtest.models.AmbiguityResolution`, because a run where
+most exits fell back to the assumption is weaker than one where most were
+resolved from real data, and the report has to be able to say so.
+
+A minute in which *both* levels are reached is ambiguous at 1-minute resolution
+too. It takes the stop, and it records ``PESSIMISTIC_FALLBACK`` rather than
+``RESOLVED_BY_1M`` - the minute data was read but did not decide, and the label
+names what actually decided.
 """
 
 from __future__ import annotations
@@ -84,8 +111,8 @@ from enum import StrEnum
 
 from app.core.time import ensure_utc
 from app.domain.backtest.config import ExecutionConfig, SlippageConfig
-from app.domain.backtest.models import Fill, FillReason, OrderSide
-from app.domain.market.models import Candle, CandleStatus
+from app.domain.backtest.models import AmbiguityResolution, Fill, FillReason, OrderSide
+from app.domain.market.models import Candle, CandleInterval, CandleStatus
 from app.domain.market.ports import DataGap
 from app.domain.strategy.contract import Signal, SignalDirection
 
@@ -93,8 +120,10 @@ __all__ = [
     "EntryOutcome",
     "ExecutionIntent",
     "ExecutionStatus",
+    "ExitResolution",
     "UnexecutableBarError",
     "resolve_entry_fill",
+    "resolve_exit_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
 ]
@@ -492,3 +521,123 @@ def resolve_entry_fill(
             bar_start=next_bar.start_at,
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ExitResolution:
+    """How a bar's exit was decided, and by which tier.
+
+    ``ambiguity`` is ``UNAMBIGUOUS`` whenever only one level was reached, or
+    none - there was nothing to resolve. It is only ``RESOLVED_BY_1M`` or
+    ``PESSIMISTIC_FALLBACK`` when both were reached inside the same bar.
+    """
+
+    fill: Fill | None
+    ambiguity: AmbiguityResolution = AmbiguityResolution.UNAMBIGUOUS
+
+    def __post_init__(self) -> None:
+        if self.fill is None and self.ambiguity is not AmbiguityResolution.UNAMBIGUOUS:
+            raise ValueError(
+                f"no exit filled, so there was nothing to resolve, but the resolution is "
+                f"recorded as {self.ambiguity.value}"
+            )
+
+
+def _minutes_inside(bar: Candle, minute_bars: Sequence[Candle]) -> tuple[Candle, ...]:
+    """The completed 1-minute bars covering ``bar``, or ``()`` if not all are there.
+
+    Anything outside ``bar``'s own window is discarded before the count, so a
+    caller may hand over a whole session without a later minute ever reaching
+    the decision. Partial coverage is treated as no coverage: the missing
+    minute is exactly the one that might have held the answer, and filling the
+    hole with the surrounding minutes would be inventing the ordering rather
+    than reading it.
+    """
+    expected = bar.interval.seconds // 60
+    inside = sorted(
+        (
+            minute
+            for minute in minute_bars
+            if minute.interval is CandleInterval.M1
+            and minute.status is CandleStatus.COMPLETED
+            and bar.start_at <= minute.start_at
+            and minute.end_at <= bar.end_at
+        ),
+        key=lambda minute: minute.start_at,
+    )
+    if len(inside) != expected:
+        return ()
+    for index, minute in enumerate(inside):
+        if minute.start_at != bar.start_at + CandleInterval.M1.delta * index:
+            return ()
+    return tuple(inside)
+
+
+def resolve_exit_fill(
+    intent: ExecutionIntent,
+    entry: Fill,
+    bar: Candle,
+    *,
+    tick_size: Decimal,
+    execution: ExecutionConfig,
+    slippage: SlippageConfig,
+    minute_bars: Sequence[Candle] = (),
+    gaps: Sequence[DataGap] = (),
+) -> ExitResolution:
+    """The exit taken on ``bar``, resolving a same-bar stop/target collision.
+
+    Returns whichever exit the bar produced. When it produced both, the
+    minute bars decide the order if they are all present and usable, and the
+    stop is assumed if they are not - never the target.
+
+    ``minute_bars`` may hold any span; only those lying inside ``bar``'s own
+    window are consulted, so a later minute cannot reach back and change an
+    earlier bar's outcome.
+    """
+    stop = resolve_stop_fill(intent, bar, tick_size=tick_size, slippage=slippage, gaps=gaps)
+    target = resolve_target_fill(
+        intent, entry, bar, tick_size=tick_size, execution=execution, slippage=slippage, gaps=gaps
+    )
+
+    if stop is None and target is None:
+        return ExitResolution(None)
+    if target is None:
+        return ExitResolution(stop)
+    if stop is None:
+        return ExitResolution(target)
+
+    minutes = _minutes_inside(bar, minute_bars)
+    for minute in minutes:
+        try:
+            hit_stop = (
+                resolve_stop_fill(intent, minute, tick_size=tick_size, slippage=slippage, gaps=gaps)
+                is not None
+            )
+            hit_target = (
+                resolve_target_fill(
+                    intent,
+                    entry,
+                    minute,
+                    tick_size=tick_size,
+                    execution=execution,
+                    slippage=slippage,
+                    gaps=gaps,
+                )
+                is not None
+            )
+        except UnexecutableBarError:
+            # A minute that cannot answer is not evidence about the ordering.
+            # Treat the window as unresolved rather than skipping the minute,
+            # which would silently reorder the events around the hole.
+            break
+
+        if hit_stop and hit_target:
+            # Ambiguous at this resolution too. The minute data was read but
+            # did not decide, so the label names what actually did.
+            break
+        if hit_stop:
+            return ExitResolution(stop, AmbiguityResolution.RESOLVED_BY_1M)
+        if hit_target:
+            return ExitResolution(target, AmbiguityResolution.RESOLVED_BY_1M)
+
+    return ExitResolution(stop, AmbiguityResolution.PESSIMISTIC_FALLBACK)
