@@ -21,14 +21,20 @@ when a strategy actually calls for one, not in anticipation of one.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 
+from app.core.time import ist_datetime, to_ist
 from app.domain.market.models import Candle, CandleStatus
+from app.domain.market.session import MarketSessionCalendar
 
 __all__ = [
     "DEFAULT_ATR_PERIOD",
     "IndicatorError",
+    "OpeningRange",
     "average_true_range",
+    "opening_range",
     "true_range",
 ]
 
@@ -147,3 +153,115 @@ def average_true_range(candles: Sequence[Candle], period: int = DEFAULT_ATR_PERI
         for value in ranges[period:]:
             atr = (atr * Decimal(period - 1) + value) / divisor
         return +atr
+
+
+@dataclass(frozen=True, slots=True)
+class OpeningRange:
+    """The high and low of a session's opening window.
+
+    Deliberately just the measurement. Whether the range is wide enough to
+    trade, whether price has broken it, and where a stop would sit are all
+    strategy decisions and none of them live here - an indicator that already
+    knew the entry rule could not be reused by a different one, and could not be
+    checked against a chart independently of the strategy it feeds.
+    """
+
+    session_date: date
+    start_at: datetime
+    end_at: datetime
+    high: Decimal
+    low: Decimal
+    bar_count: int
+
+    @property
+    def width(self) -> Decimal:
+        """High minus low. The unit of risk the ORB hypothesis is built on."""
+        return self.high - self.low
+
+
+def opening_range(
+    candles: Sequence[Candle],
+    session_date: date,
+    calendar: MarketSessionCalendar,
+    *,
+    opening_range_minutes: int = 15,
+) -> OpeningRange:
+    """High and low across the opening window of ``session_date``.
+
+    For the approved hypothesis that window is 09:15-09:30 IST, which is exactly
+    three completed 5-minute bars. NSE runs a 09:00-09:15 pre-open call auction,
+    so the window starts at an auction-cleared price rather than mid-discovery.
+
+    The window is derived from ``calendar``, never from a wall clock: the same
+    call for the same session date returns the same window on any machine at any
+    moment, which is what lets a backtest and a live session agree.
+
+    ``candles`` may hold any span - a whole session, or several. Only bars inside
+    the window are read, so handing this a full day cannot leak an afternoon bar
+    into the morning's range.
+
+    Raises :class:`IndicatorError` rather than returning a partial range when the
+    window is not fully covered. A range measured from two of its three bars is
+    not a narrower range, it is a different and wrong number, and every stop and
+    target derived from it downstream would inherit the error silently.
+    """
+    if opening_range_minutes <= 0:
+        raise IndicatorError(f"opening_range_minutes must be positive, got {opening_range_minutes}")
+
+    _validate_bars(candles, "candles")
+    interval = candles[0].interval
+
+    if (opening_range_minutes * 60) % interval.seconds != 0:
+        raise IndicatorError(
+            f"a {opening_range_minutes}-minute opening range is not a whole number of "
+            f"{interval.value} bars; the window would end mid-bar and its high and low would "
+            "depend on data the strategy could not yet have seen"
+        )
+
+    bounds = calendar.session_bounds(ist_datetime(session_date, calendar.window.open_time))
+    if bounds is None:
+        raise IndicatorError(
+            f"{session_date.isoformat()} is not a trading day on the "
+            f"{calendar.window.name} calendar, so it has no opening range"
+        )
+    window_start, _ = bounds
+    window_end = window_start + timedelta(minutes=opening_range_minutes)
+
+    if int(window_start.timestamp()) % interval.seconds != 0:
+        raise IndicatorError(
+            f"the {calendar.window.name} session starts at "
+            f"{calendar.window.open_time.isoformat()} IST, which is not aligned to a "
+            f"{interval.value} boundary; bar boundaries are epoch-aligned, so no bar begins "
+            "when this session does"
+        )
+
+    expected = tuple(
+        window_start + interval.delta * step
+        for step in range((opening_range_minutes * 60) // interval.seconds)
+    )
+    window_bars = tuple(
+        candle for candle in candles if window_start <= candle.start_at < window_end
+    )
+
+    if tuple(candle.start_at for candle in window_bars) != expected:
+        present = {candle.start_at for candle in window_bars}
+        missing = [moment for moment in expected if moment not in present]
+        detail = (
+            "missing " + ", ".join(to_ist(moment).time().isoformat() for moment in missing) + " IST"
+            if missing
+            else "its bars are not on the expected boundaries"
+        )
+        raise IndicatorError(
+            f"the {opening_range_minutes}-minute opening range for "
+            f"{session_date.isoformat()} needs {len(expected)} {interval.value} bars but "
+            f"{detail}; the range cannot be measured from an incomplete window"
+        )
+
+    return OpeningRange(
+        session_date=session_date,
+        start_at=window_start,
+        end_at=window_end,
+        high=max(candle.high for candle in window_bars),
+        low=min(candle.low for candle in window_bars),
+        bar_count=len(window_bars),
+    )

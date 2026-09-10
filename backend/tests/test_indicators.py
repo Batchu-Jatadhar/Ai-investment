@@ -7,7 +7,7 @@ differ. Bars are built explicitly - nothing reads a clock, a file or a database.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
 import pytest
@@ -15,14 +15,17 @@ import pytest
 from app.domain.indicators import (
     IndicatorError,
     average_true_range,
+    opening_range,
     true_range,
 )
 from app.domain.market.models import Candle, CandleInterval, CandleStatus
+from app.domain.market.session import MarketSessionCalendar, SessionWindow
 
 RELIANCE_TOKEN = 738561
 
 #: 2026-08-21 09:15 IST == 03:45 UTC. A Friday, and a normal trading day.
 SESSION_OPEN = datetime(2026, 8, 21, 3, 45, tzinfo=UTC)
+SESSION_DATE = date(2026, 8, 21)
 
 
 def bar(
@@ -163,3 +166,102 @@ class TestAverageTrueRange:
     def test_a_meaningless_period_is_rejected(self) -> None:
         with pytest.raises(IndicatorError, match="at least 1"):
             average_true_range(EXACT_SERIES, period=0)
+
+
+#: The approved 09:15-09:30 IST window: exactly three completed 5-minute bars.
+#: The extreme high and the extreme low sit on different bars, and neither on
+#: the first, so an implementation that read only one bar could not pass.
+#:
+#:   09:15  H 1405  L 1398
+#:   09:20  H 1402  L 1390  <- session low
+#:   09:25  H 1412  L 1400  <- session high
+OPENING_BARS = (
+    bar(0, "1405", "1398", "1400"),
+    bar(1, "1402", "1390", "1395"),
+    bar(2, "1412", "1400", "1410"),
+)
+
+NSE = MarketSessionCalendar.nse_equity()
+
+
+class TestOpeningRange:
+    def test_the_range_spans_all_three_opening_bars(self) -> None:
+        found = opening_range(OPENING_BARS, SESSION_DATE, NSE)
+        assert found.high == Decimal("1412")
+        assert found.low == Decimal("1390")
+        assert found.width == Decimal("22")
+        assert found.bar_count == 3
+
+    def test_the_window_is_09_15_to_09_30_ist(self) -> None:
+        found = opening_range(OPENING_BARS, SESSION_DATE, NSE)
+        assert found.session_date == SESSION_DATE
+        assert found.start_at == SESSION_OPEN
+        assert found.end_at == datetime(2026, 8, 21, 4, 0, tzinfo=UTC)
+
+    def test_afternoon_bars_cannot_reach_the_morning_range(self) -> None:
+        """Only the window is read, however much data is handed over.
+
+        The later bars are deliberately extreme, so if any of them leaked into
+        the range the assertion could not pass by luck.
+        """
+        rest_of_day = (bar(20, "1600", "1300", "1500"), bar(21, "1700", "1200", "1400"))
+        assert opening_range((*OPENING_BARS, *rest_of_day), SESSION_DATE, NSE) == opening_range(
+            OPENING_BARS, SESSION_DATE, NSE
+        )
+
+    def test_a_missing_opening_bar_is_rejected(self) -> None:
+        """Two of three bars is not a narrower range, it is a wrong number."""
+        with pytest.raises(IndicatorError, match="missing 09:20:00 IST"):
+            opening_range((OPENING_BARS[0], OPENING_BARS[2]), SESSION_DATE, NSE)
+
+    def test_an_in_progress_opening_bar_is_rejected(self) -> None:
+        live = (
+            *OPENING_BARS[:2],
+            bar(2, "1412", "1400", "1410", status=CandleStatus.IN_PROGRESS),
+        )
+        with pytest.raises(IndicatorError, match="in_progress"):
+            opening_range(live, SESSION_DATE, NSE)
+
+    def test_a_non_trading_day_is_rejected(self) -> None:
+        """2026-08-22 is a Saturday, so it has no session to open."""
+        with pytest.raises(IndicatorError, match="not a trading day"):
+            opening_range(OPENING_BARS, date(2026, 8, 22), NSE)
+
+    def test_a_holiday_is_rejected(self) -> None:
+        closed = MarketSessionCalendar.nse_equity(holidays=[SESSION_DATE])
+        with pytest.raises(IndicatorError, match="not a trading day"):
+            opening_range(OPENING_BARS, SESSION_DATE, closed)
+
+    def test_a_session_that_does_not_start_on_a_bar_boundary_is_rejected(self) -> None:
+        """Bar boundaries are epoch-aligned, so a 09:16 session has no first bar.
+
+        Reported as the structural problem it is, rather than as three missing
+        bars, which is what a naive lookup would have said.
+        """
+        odd = MarketSessionCalendar(
+            window=SessionWindow(
+                name="ODD",
+                pre_open_start=time(9, 0),
+                open_time=time(9, 16),
+                close_time=time(15, 30),
+                post_close_end=time(16, 0),
+            )
+        )
+        with pytest.raises(IndicatorError, match="not aligned"):
+            opening_range(OPENING_BARS, SESSION_DATE, odd)
+
+    def test_a_window_that_ends_mid_bar_is_rejected(self) -> None:
+        with pytest.raises(IndicatorError, match="not a whole number"):
+            opening_range(OPENING_BARS, SESSION_DATE, NSE, opening_range_minutes=7)
+
+    def test_the_window_length_is_configurable_but_must_be_positive(self) -> None:
+        first_bar_only = opening_range(OPENING_BARS, SESSION_DATE, NSE, opening_range_minutes=5)
+        assert first_bar_only.bar_count == 1
+        assert first_bar_only.high == Decimal("1405")
+        with pytest.raises(IndicatorError, match="must be positive"):
+            opening_range(OPENING_BARS, SESSION_DATE, NSE, opening_range_minutes=0)
+
+    def test_the_range_is_immutable(self) -> None:
+        found = opening_range(OPENING_BARS, SESSION_DATE, NSE)
+        with pytest.raises(AttributeError):
+            found.high = Decimal("9999")  # type: ignore[misc]
