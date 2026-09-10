@@ -11,12 +11,17 @@ import pytest
 from app.core.time import NaiveDatetimeError
 from app.domain.backtest.config import ExecutionConfig, SlippageConfig
 from app.domain.backtest.execution import (
+    EntryOutcome,
     ExecutionIntent,
+    ExecutionStatus,
+    UnexecutableBarError,
+    resolve_entry_fill,
     resolve_stop_fill,
     resolve_target_fill,
 )
 from app.domain.backtest.models import Fill, FillReason, OrderSide
 from app.domain.market.models import CandleInterval, CandleStatus
+from app.domain.market.ports import DataGap
 from app.domain.strategy.contract import Signal, SignalDirection
 from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_OPEN, make_candle
 
@@ -482,3 +487,228 @@ class TestTargetDeterminismAndGuards:
                 execution=THROUGH_ONE_TICK,
                 slippage=ONE_TICK,
             )
+
+
+# --------------------------------------------------------------------------- #
+# Gap and invalid-data handling
+# --------------------------------------------------------------------------- #
+
+
+def entry_bar(**overrides: object) -> object:
+    """The bar named by the intent, so an entry can be resolved against it."""
+    values: dict[str, object] = {
+        "open_": "1405",
+        "high": "1410",
+        "low": "1403",
+        "close": "1408",
+    }
+    values.update(overrides)
+    return make_candle(NEXT_BAR, CandleInterval.M5, **values)  # type: ignore[arg-type]
+
+
+def gap_over(bar, **overrides: object) -> DataGap:  # noqa: ANN001
+    values: dict[str, object] = {
+        "provider": "test",
+        "started_at": bar.start_at,
+        "ended_at": bar.end_at,
+        "reason": "socket reconnect",
+    }
+    values.update(overrides)
+    return DataGap(**values)  # type: ignore[arg-type]
+
+
+class TestEntryExecution:
+    def test_an_entry_fills_at_the_next_bar_opening_price(self) -> None:
+        outcome = resolve_entry_fill(make_intent(), entry_bar(), tick_size=TICK, slippage=ONE_TICK)
+
+        assert outcome.status is ExecutionStatus.FILLED
+        assert outcome.fill is not None
+        assert outcome.fill.side is OrderSide.BUY
+        assert outcome.fill.reason is FillReason.ENTRY
+        assert outcome.fill.reference_price == Decimal("1405")
+        assert outcome.fill.price == Decimal("1405.05")
+
+    def test_a_short_entry_sells_down(self) -> None:
+        outcome = resolve_entry_fill(short_intent(), entry_bar(), tick_size=TICK, slippage=ONE_TICK)
+
+        assert outcome.fill is not None
+        assert outcome.fill.side is OrderSide.SELL
+        assert outcome.fill.price == Decimal("1404.95")
+
+    def test_a_signal_with_no_next_bar_reports_no_execution_bar(self) -> None:
+        """The session ended before the entry bar existed. An ordinary
+        end-of-day outcome, and nothing is fabricated for it."""
+        outcome = resolve_entry_fill(make_intent(), None, tick_size=TICK, slippage=ONE_TICK)
+
+        assert outcome == EntryOutcome(ExecutionStatus.NO_EXECUTION_BAR, None)
+        assert outcome.fill is None
+
+    def test_entering_on_a_bar_the_intent_did_not_name_is_rejected(self) -> None:
+        wrong = make_candle(
+            NEXT_BAR + CandleInterval.M5.delta,
+            CandleInterval.M5,
+            open_="1405",
+            high="1410",
+            low="1403",
+            close="1408",
+        )
+        with pytest.raises(ValueError, match="but the intent names"):
+            resolve_entry_fill(make_intent(), wrong, tick_size=TICK, slippage=ONE_TICK)
+
+    def test_an_outcome_cannot_misreport_itself(self) -> None:
+        with pytest.raises(ValueError, match="disagree"):
+            EntryOutcome(ExecutionStatus.FILLED, None)
+        with pytest.raises(ValueError, match="disagree"):
+            EntryOutcome(ExecutionStatus.NO_EXECUTION_BAR, entry_fill())
+
+
+class TestUnusableBars:
+    """A bar that cannot answer the question is not the same as a bar that
+    answers "no", and the two must not both come back as silence."""
+
+    def test_a_zero_volume_bar_cannot_establish_an_entry(self) -> None:
+        with pytest.raises(UnexecutableBarError) as caught:
+            resolve_entry_fill(
+                make_intent(), entry_bar(volume=0), tick_size=TICK, slippage=ONE_TICK
+            )
+        assert caught.value.status is ExecutionStatus.NO_VOLUME
+
+    def test_a_zero_volume_bar_cannot_establish_a_stop(self) -> None:
+        """Without this the stop would fill at a price nobody paid."""
+        bar = position_bar(open_="1400", high="1405", low="1388", close="1395")
+        assert stop_fill(make_intent(), bar) is not None
+
+        tradeless = dataclasses.replace(bar, volume=0)
+        with pytest.raises(UnexecutableBarError) as caught:
+            stop_fill(make_intent(), tradeless)
+        assert caught.value.status is ExecutionStatus.NO_VOLUME
+
+    def test_a_zero_volume_bar_cannot_establish_a_target(self) -> None:
+        bar = position_bar(open_="1405", high="1425", low="1404", close="1422")
+        assert target_fill(make_intent(), bar) is not None
+
+        tradeless = dataclasses.replace(bar, volume=0)
+        with pytest.raises(UnexecutableBarError) as caught:
+            target_fill(make_intent(), tradeless)
+        assert caught.value.status is ExecutionStatus.NO_VOLUME
+
+    def test_a_flat_tradeless_bar_is_reported_as_no_range(self) -> None:
+        """The more specific fact: it neither moved nor traded, so it is a
+        placeholder rather than a bar."""
+        placeholder = entry_bar(open_="1405", high="1405", low="1405", close="1405", volume=0)
+
+        with pytest.raises(UnexecutableBarError) as caught:
+            resolve_entry_fill(make_intent(), placeholder, tick_size=TICK, slippage=ONE_TICK)
+        assert caught.value.status is ExecutionStatus.NO_RANGE
+
+    def test_a_flat_bar_that_did_trade_is_still_executable(self) -> None:
+        """ "Where execution cannot be established" is a real qualifier. One
+        price printed and it is a real one - an instrument that traded once in
+        five minutes is thin, not corrupt, and discarding it would throw away
+        data the market actually made."""
+        thin = entry_bar(open_="1405", high="1405", low="1405", close="1405", volume=1)
+        outcome = resolve_entry_fill(make_intent(), thin, tick_size=TICK, slippage=ONE_TICK)
+
+        assert outcome.status is ExecutionStatus.FILLED
+        assert outcome.fill is not None
+        assert outcome.fill.reference_price == Decimal("1405")
+
+
+class TestRecordedDataGaps:
+    def test_a_bar_inside_a_recorded_gap_cannot_be_executed_on(self) -> None:
+        """The feed was not delivering, so the bar's extremes are whatever
+        happened to arrive rather than what traded."""
+        bar = entry_bar()
+        with pytest.raises(UnexecutableBarError) as caught:
+            resolve_entry_fill(
+                make_intent(),
+                bar,
+                tick_size=TICK,
+                slippage=ONE_TICK,
+                gaps=[gap_over(bar)],
+            )
+        assert caught.value.status is ExecutionStatus.INSIDE_DATA_GAP
+
+    def test_a_stop_will_not_fill_from_a_bar_inside_a_gap(self) -> None:
+        bar = position_bar(open_="1400", high="1405", low="1388", close="1395")
+        with pytest.raises(UnexecutableBarError):
+            resolve_stop_fill(
+                make_intent(),
+                bar,
+                tick_size=TICK,
+                slippage=ONE_TICK,
+                gaps=[gap_over(bar)],
+            )
+
+    def test_a_gap_that_ends_before_the_bar_starts_does_not_taint_it(self) -> None:
+        """Touching endpoints do not overlap: a gap that closed exactly as the
+        bar opened left the bar with a complete feed."""
+        bar = entry_bar()
+        earlier = gap_over(
+            bar, started_at=bar.start_at - timedelta(minutes=10), ended_at=bar.start_at
+        )
+
+        outcome = resolve_entry_fill(
+            make_intent(), bar, tick_size=TICK, slippage=ONE_TICK, gaps=[earlier]
+        )
+        assert outcome.status is ExecutionStatus.FILLED
+
+    def test_a_gap_recorded_for_another_instrument_is_ignored(self) -> None:
+        bar = entry_bar()
+        elsewhere = gap_over(bar, instrument_tokens=(408065,))
+
+        outcome = resolve_entry_fill(
+            make_intent(), bar, tick_size=TICK, slippage=ONE_TICK, gaps=[elsewhere]
+        )
+        assert outcome.status is ExecutionStatus.FILLED
+
+    def test_a_gap_naming_this_instrument_still_bites(self) -> None:
+        bar = entry_bar()
+        ours = gap_over(bar, instrument_tokens=(RELIANCE_TOKEN,))
+
+        with pytest.raises(UnexecutableBarError):
+            resolve_entry_fill(make_intent(), bar, tick_size=TICK, slippage=ONE_TICK, gaps=[ours])
+
+
+class TestGapThroughStopStillFillsAtTheOpen:
+    def test_a_stop_gapped_through_fills_at_the_opening_price(self) -> None:
+        """Held here as well as with the stop itself: this is the one gap case
+        that must still produce a fill, and hardening the others must not have
+        quietly turned it into a refusal."""
+        bar = position_bar(open_="1380", high="1385", low="1375", close="1378")
+        fill = stop_fill(make_intent(), bar)
+
+        assert fill is not None
+        assert fill.reference_price == Decimal("1380")
+        assert fill.occurred_at == bar.start_at
+
+
+class TestNothingIsManufacturedSilently:
+    def test_every_invalid_case_is_explicit_rather_than_silent(self) -> None:
+        """The point of the whole group: a bar that cannot answer must never
+        come back looking like a bar that answered "no"."""
+        would_have_filled = position_bar(open_="1400", high="1405", low="1388", close="1395")
+        assert stop_fill(make_intent(), would_have_filled) is not None
+
+        for broken in (
+            dataclasses.replace(would_have_filled, volume=0),
+            dataclasses.replace(
+                would_have_filled,
+                high=Decimal("1400"),
+                low=Decimal("1400"),
+                open=Decimal("1400"),
+                close=Decimal("1400"),
+                volume=0,
+            ),
+        ):
+            with pytest.raises(UnexecutableBarError):
+                stop_fill(make_intent(), broken)
+
+    def test_the_same_unusable_bar_always_fails_the_same_way(self) -> None:
+        bar = entry_bar(volume=0)
+        statuses = set()
+        for _ in range(3):
+            with pytest.raises(UnexecutableBarError) as caught:
+                resolve_entry_fill(make_intent(), bar, tick_size=TICK, slippage=ONE_TICK)
+            statuses.add(caught.value.status)
+        assert statuses == {ExecutionStatus.NO_VOLUME}

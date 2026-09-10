@@ -18,7 +18,11 @@ conflated with this simulation.
 
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.backtest.execution import (
+    EntryOutcome,
     ExecutionIntent,
+    ExecutionStatus,
+    UnexecutableBarError,
+    resolve_entry_fill,
     resolve_stop_fill,
     resolve_target_fill,
 )
@@ -40,9 +44,11 @@ __all__ = [
     "BacktestInput",
     "BacktestResult",
     "CostSchedule",
+    "EntryOutcome",
     "EquityPoint",
     "ExecutionConfig",
     "ExecutionIntent",
+    "ExecutionStatus",
     "Fill",
     "FillReason",
     "InvalidBacktestInputError",
@@ -51,6 +57,8 @@ __all__ = [
     "SignalRecord",
     "SlippageConfig",
     "Trade",
+    "UnexecutableBarError",
+    "resolve_entry_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
 ]

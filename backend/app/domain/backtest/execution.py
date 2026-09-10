@@ -50,21 +50,109 @@ The two exits are pessimistic in opposite directions, and both deliberately:
     than the one being modelled.
 
 Neither exit is ever credited with the good half of a surprise.
+
+.. rubric:: When execution cannot be established
+
+Two different things can stop a fill happening, and conflating them is how a
+backtest quietly reports a number it did not earn.
+
+*   **The market did not do it.** The stop was not touched, the target was not
+    traded through, the session ended before the entry bar existed. These are
+    ordinary results. They are returned - ``None`` for an exit that survived,
+    :attr:`ExecutionStatus.NO_EXECUTION_BAR` for a signal with nowhere to fill.
+
+*   **The data cannot say.** A bar with no volume, a flat bar with no trades,
+    a bar overlapping a recorded :class:`~app.domain.market.ports.DataGap`.
+    Here the honest answer is not "no fill" - it is "this bar cannot answer the
+    question", and the two are opposite. Reporting silence would let a run
+    trade straight through a hole in its own data and show a clean equity curve
+    for it. These raise :class:`UnexecutableBarError`, because deciding what to
+    do about a hole - quarantine the session, skip the instrument, abandon the
+    run - is the engine's call and cannot be made inside a fill resolver.
+
+The rule in one line: *the market saying no is a result, the data being unable
+to say is an error.*
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from app.core.time import ensure_utc
 from app.domain.backtest.config import ExecutionConfig, SlippageConfig
 from app.domain.backtest.models import Fill, FillReason, OrderSide
 from app.domain.market.models import Candle, CandleStatus
+from app.domain.market.ports import DataGap
 from app.domain.strategy.contract import Signal, SignalDirection
 
-__all__ = ["ExecutionIntent", "resolve_stop_fill", "resolve_target_fill"]
+__all__ = [
+    "EntryOutcome",
+    "ExecutionIntent",
+    "ExecutionStatus",
+    "UnexecutableBarError",
+    "resolve_entry_fill",
+    "resolve_stop_fill",
+    "resolve_target_fill",
+]
+
+
+class ExecutionStatus(StrEnum):
+    """What became of an attempt to execute.
+
+    One enum for both axes on purpose: a run's execution log wants a single
+    column it can count, not a status that sometimes lives in a return value
+    and sometimes in an exception type.
+    """
+
+    FILLED = "filled"
+    #: The signal had no bar to be entered on - the session ended first.
+    NO_EXECUTION_BAR = "no_execution_bar"
+    #: The bar recorded no trades, so no price on it was ever transacted.
+    NO_VOLUME = "no_volume"
+    #: The bar neither moved nor traded: a placeholder, not a bar.
+    NO_RANGE = "no_range"
+    #: The bar overlaps a recorded gap in the feed, so its prices are suspect.
+    INSIDE_DATA_GAP = "inside_data_gap"
+
+
+class UnexecutableBarError(ValueError):
+    """Raised when a bar cannot establish an execution at all.
+
+    Distinct from "the level was not reached", which is an ordinary result and
+    is returned rather than raised. This says the data is unusable, and it
+    carries :attr:`status` so a caller can branch on the kind rather than
+    matching on message text.
+    """
+
+    def __init__(self, status: ExecutionStatus, bar_start: datetime, detail: str) -> None:
+        self.status = status
+        self.bar_start = bar_start
+        super().__init__(f"bar at {bar_start.isoformat()} is unusable ({status.value}): {detail}")
+
+
+@dataclass(frozen=True, slots=True)
+class EntryOutcome:
+    """The result of trying to enter, and why it turned out that way.
+
+    Mirrors ``OrbDecision`` one layer up: the fill and the reason travel
+    together, so the path where nothing happened cannot be logged without
+    saying what happened instead.
+    """
+
+    status: ExecutionStatus
+    fill: Fill | None
+
+    def __post_init__(self) -> None:
+        if (self.status is ExecutionStatus.FILLED) != (self.fill is not None):
+            raise ValueError(
+                f"status {self.status.value} and "
+                f"{'a fill' if self.fill else 'no fill'} disagree; a filled entry must carry "
+                "its fill and an unfilled one must not"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +223,7 @@ def resolve_stop_fill(
     *,
     tick_size: Decimal,
     slippage: SlippageConfig,
+    gaps: Sequence[DataGap] = (),
 ) -> Fill | None:
     """The protective stop's fill on ``bar``, or ``None`` if it survived.
 
@@ -182,6 +271,8 @@ def resolve_stop_fill(
     if tick_size <= 0:
         raise ValueError(f"tick_size must be positive, got {tick_size}")
 
+    _require_executable(bar, intent, gaps)
+
     stop = intent.signal.stop_price
     is_long = intent.direction.is_long
 
@@ -219,6 +310,7 @@ def resolve_target_fill(
     tick_size: Decimal,
     execution: ExecutionConfig,
     slippage: SlippageConfig,
+    gaps: Sequence[DataGap] = (),
 ) -> Fill | None:
     """The target's fill on ``bar``, or ``None`` if it was not reached.
 
@@ -270,6 +362,8 @@ def resolve_target_fill(
     if tick_size <= 0:
         raise ValueError(f"tick_size must be positive, got {tick_size}")
 
+    _require_executable(bar, intent, gaps)
+
     is_long = intent.direction.is_long
     risk = abs(entry.price - intent.signal.stop_price)
     if risk == 0:
@@ -302,4 +396,99 @@ def resolve_target_fill(
         # honestly be said is that it had happened by the close.
         occurred_at=bar.end_at,
         bar_start=bar.start_at,
+    )
+
+
+def _require_executable(bar: Candle, intent: ExecutionIntent, gaps: Sequence[DataGap]) -> None:
+    """Refuse a bar that cannot establish any execution.
+
+    Order matters: a bar that neither moved nor traded is described as
+    :attr:`ExecutionStatus.NO_RANGE`, the more specific fact, rather than as
+    merely volumeless.
+
+    A flat bar that *did* trade is left alone. One price printed and it is a
+    real one - an illiquid instrument that traded once in five minutes is thin,
+    not corrupt, and rejecting it would discard data the market actually made.
+    """
+    if bar.high == bar.low and bar.volume == 0:
+        raise UnexecutableBarError(
+            ExecutionStatus.NO_RANGE,
+            bar.start_at,
+            "it neither moved nor traded, so it is a placeholder rather than a bar and no "
+            "price on it was ever transacted",
+        )
+    if bar.volume == 0:
+        raise UnexecutableBarError(
+            ExecutionStatus.NO_VOLUME,
+            bar.start_at,
+            f"it spans {bar.low}-{bar.high} but recorded no trades, so any fill taken from it "
+            "would be a price nobody paid",
+        )
+    for gap in gaps:
+        if gap.instrument_tokens and intent.instrument_token not in gap.instrument_tokens:
+            continue
+        if bar.start_at < gap.ended_at and bar.end_at > gap.started_at:
+            raise UnexecutableBarError(
+                ExecutionStatus.INSIDE_DATA_GAP,
+                bar.start_at,
+                f"it overlaps a recorded gap from {gap.started_at.isoformat()} to "
+                f"{gap.ended_at.isoformat()} ({gap.reason}); the feed was not delivering, so "
+                "the bar's extremes are whatever happened to arrive rather than what traded",
+            )
+
+
+def resolve_entry_fill(
+    intent: ExecutionIntent,
+    next_bar: Candle | None,
+    *,
+    tick_size: Decimal,
+    slippage: SlippageConfig,
+    gaps: Sequence[DataGap] = (),
+) -> EntryOutcome:
+    """Enter at ``next_bar``'s opening price, or report why not.
+
+    ``next_bar`` is the bar named by :attr:`ExecutionIntent.entry_bar_start`,
+    or ``None`` when there is not one - a signal on the session's last bar has
+    nowhere to be filled, and that is an ordinary end-of-day outcome rather
+    than an error. It is reported as
+    :attr:`ExecutionStatus.NO_EXECUTION_BAR` and nothing is fabricated.
+
+    Slippage is adverse: a long pays up, a short sells down.
+    """
+    if next_bar is None:
+        return EntryOutcome(ExecutionStatus.NO_EXECUTION_BAR, None)
+
+    if next_bar.status is not CandleStatus.COMPLETED:
+        raise ValueError(
+            f"the bar at {next_bar.start_at.isoformat()} is {next_bar.status.value}; an entry "
+            "cannot be resolved against a bar that is still forming"
+        )
+    if next_bar.start_at != intent.entry_bar_start:
+        raise ValueError(
+            f"next_bar starts at {next_bar.start_at.isoformat()} but the intent names "
+            f"{intent.entry_bar_start.isoformat()}; entering on any other bar would be "
+            "executing at a price the signal could not have been acted on at"
+        )
+    if tick_size <= 0:
+        raise ValueError(f"tick_size must be positive, got {tick_size}")
+
+    _require_executable(next_bar, intent, gaps)
+
+    adverse = slippage.adverse_ticks * tick_size
+    reference = next_bar.open
+    price = reference + adverse if intent.entry_side is OrderSide.BUY else reference - adverse
+
+    return EntryOutcome(
+        ExecutionStatus.FILLED,
+        Fill(
+            side=intent.entry_side,
+            reason=FillReason.ENTRY,
+            quantity=intent.quantity,
+            price=price,
+            reference_price=reference,
+            slippage_per_unit=adverse,
+            costs=Decimal(0),
+            occurred_at=next_bar.start_at,
+            bar_start=next_bar.start_at,
+        ),
     )
