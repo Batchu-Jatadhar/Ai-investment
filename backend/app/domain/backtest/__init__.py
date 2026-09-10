@@ -47,7 +47,6 @@ from app.domain.backtest.metrics import (
 )
 from app.domain.backtest.models import (
     AmbiguityResolution,
-    BacktestResult,
     EquityPoint,
     Fill,
     FillReason,
@@ -58,6 +57,7 @@ from app.domain.backtest.models import (
 )
 from app.domain.backtest.portfolio import Portfolio
 from app.domain.backtest.position import Position, PositionBook, PositionTransitionError
+from app.domain.backtest.result import BacktestResult
 from app.domain.backtest.sizing import PositionSizeError, fixed_notional_quantity
 
 __all__ = [

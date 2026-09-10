@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import textwrap
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -11,7 +12,6 @@ import pytest
 from app.core.time import NaiveDatetimeError
 from app.domain.backtest.models import (
     AmbiguityResolution,
-    BacktestResult,
     EquityPoint,
     Fill,
     FillReason,
@@ -20,6 +20,7 @@ from app.domain.backtest.models import (
     SignalRecord,
     Trade,
 )
+from app.domain.backtest.result import BacktestResult
 from app.domain.strategy.contract import Signal, SignalDirection
 from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_OPEN
 
@@ -387,10 +388,31 @@ class TestBacktestResult:
         assert len(result.equity_curve) == 2
 
     def test_result_owns_no_calculation(self) -> None:
-        """Metrics arrive in Phase 2.5; a result computes nothing."""
+        """A result still computes nothing, now that metrics exist.
+
+        Phase 2.0 asserted this by requiring no public methods at all. Phase 2.5
+        gives it two - ``measured`` delegates to the metrics layer and
+        ``canonical`` renders what is already there - so the invariant is
+        checked directly instead of by proxy: the class body contains no
+        arithmetic whatsoever, on any figure.
+        """
+        import ast
+        import inspect
+
+        source = textwrap.dedent(inspect.getsource(BacktestResult))
+        body = ast.parse(source).body[0]
+
         public = {
             name
             for name in vars(BacktestResult)
             if not name.startswith("_") and callable(getattr(BacktestResult, name, None))
         }
-        assert public == set()
+        arithmetic = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow)
+        sums = [
+            node
+            for node in ast.walk(body)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, arithmetic)
+        ]
+
+        assert public == {"measured", "canonical"}
+        assert sums == [], "a result must delegate every calculation, not perform one"

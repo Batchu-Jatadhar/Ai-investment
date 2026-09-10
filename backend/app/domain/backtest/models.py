@@ -1,8 +1,13 @@
 """Backtest result value objects.
 
 Pure data. **Nothing here simulates, fills, prices or computes a metric.** The
-components that produce these values arrive later: fills in Phase 2.3, trades
-and the equity curve in Phase 2.4, metrics in Phase 2.5.
+components that produce these values arrived in Phase 2.3 (fills), Phase 2.4
+(trades and the equity curve) and Phase 2.5 (metrics).
+
+``BacktestResult`` lives one level up, in ``result.py``, because it holds a
+``PerformanceReport`` and the metrics that produce one are computed *from* the
+types here. Keeping the aggregate above its parts is what stops that dependency
+becoming a cycle.
 
 What these types do own is their own consistency. A :class:`Trade` whose net
 does not equal gross minus costs, or whose entry and exit quantities differ, is
@@ -24,7 +29,6 @@ from app.domain.strategy.contract import Signal, SignalDirection
 
 __all__ = [
     "AmbiguityResolution",
-    "BacktestResult",
     "EquityPoint",
     "Fill",
     "FillReason",
@@ -295,33 +299,3 @@ class RunManifest:
         for name in ("strategy_name", "strategy_version", "engine_version"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must be recorded so a run can be identified")
-
-
-@dataclass(frozen=True, slots=True)
-class BacktestResult:
-    """The complete output of one backtest run.
-
-    A value object. It computes nothing: the typed performance-metrics field is
-    added in Phase 2.5, once the metrics themselves exist.
-    """
-
-    manifest: RunManifest
-    signal_log: tuple[SignalRecord, ...] = ()
-    trades: tuple[Trade, ...] = ()
-    equity_curve: tuple[EquityPoint, ...] = ()
-
-    def __post_init__(self) -> None:
-        for name in ("signal_log", "trades", "equity_curve"):
-            if not isinstance(getattr(self, name), tuple):
-                raise TypeError(
-                    f"{name} must be a tuple; a result is immutable so that it cannot be "
-                    "edited after the run that produced it"
-                )
-        previous: datetime | None = None
-        for point in self.equity_curve:
-            if previous is not None and point.at < previous:
-                raise ValueError(
-                    f"equity_curve must be ordered in time; {point.at.isoformat()} follows "
-                    f"{previous.isoformat()}"
-                )
-            previous = point.at
