@@ -17,7 +17,7 @@ conflated with this simulation.
 """
 
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
-from app.domain.backtest.execution import ExecutionIntent
+from app.domain.backtest.execution import ExecutionIntent, resolve_stop_fill
 from app.domain.backtest.input import BacktestInput, InvalidBacktestInputError
 from app.domain.backtest.models import (
     AmbiguityResolution,
@@ -47,4 +47,5 @@ __all__ = [
     "SignalRecord",
     "SlippageConfig",
     "Trade",
+    "resolve_stop_fill",
 ]
