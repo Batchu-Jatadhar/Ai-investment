@@ -42,6 +42,7 @@ from app.domain.backtest.models import (
     SignalRecord,
     Trade,
 )
+from app.domain.backtest.portfolio import Portfolio
 from app.domain.backtest.position import Position, PositionBook, PositionTransitionError
 from app.domain.backtest.sizing import PositionSizeError, fixed_notional_quantity
 
@@ -61,6 +62,7 @@ __all__ = [
     "FillReason",
     "InvalidBacktestInputError",
     "OrderSide",
+    "Portfolio",
     "Position",
     "PositionBook",
     "PositionSizeError",
