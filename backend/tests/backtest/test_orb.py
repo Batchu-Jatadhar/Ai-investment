@@ -6,17 +6,23 @@ can be read off the numbers in the test itself.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
-from app.domain.indicators import OpeningRange, opening_range
+from app.domain.indicators import IndicatorError, OpeningRange, opening_range
 from app.domain.market.models import Candle, CandleInterval, CandleStatus
 from app.domain.market.session import MarketSessionCalendar
-from app.domain.strategy.contract import SignalDirection
-from app.domain.strategy.orb import breakout_direction
-from tests.backtest.conftest import RELIANCE_TOKEN, SESSION_DATE, SESSION_OPEN, make_candle
+from app.domain.strategy.contract import Signal, SignalDirection, Strategy, StrategyContext
+from app.domain.strategy.orb import OrbDecision, OrbReason, OrbStrategy, breakout_direction
+from tests.backtest.conftest import (
+    RELIANCE_TOKEN,
+    SESSION_DATE,
+    SESSION_OPEN,
+    make_candle,
+    make_instrument,
+)
 
 #: 09:15-09:30 IST == 03:45-04:00 UTC, low 1390, high 1412.
 RANGE = OpeningRange(
@@ -30,6 +36,42 @@ RANGE = OpeningRange(
 
 #: 09:30 IST - the first bar that could possibly break the range.
 FIRST_DECIDABLE = datetime(2026, 8, 21, 4, 0, tzinfo=UTC)
+
+
+def five_minute(index: int, *, high: str, low: str, close: str) -> Candle:
+    """The ``index``-th 5m bar of the session, counting from 09:15 IST."""
+    return make_candle(
+        SESSION_OPEN + CandleInterval.M5.delta * index,
+        CandleInterval.M5,
+        open_="1400",
+        high=high,
+        low=low,
+        close=close,
+    )
+
+
+#: The three 09:15-09:30 bars, giving a range of 1390-1412 (width 22).
+OPENING_BARS = (
+    five_minute(0, high="1405", low="1398", close="1400"),
+    five_minute(1, high="1402", low="1390", close="1395"),
+    five_minute(2, high="1412", low="1400", close="1410"),
+)
+
+#: A prior ATR that clears the hypothesis' filters for a 22-wide range: the
+#: ceiling is 1.5 x 30 = 45, and the floor is 4 ticks x 0.05 = 0.20.
+PRIOR_ATR = Decimal("30")
+
+
+def context(**overrides: object) -> StrategyContext:
+    values: dict[str, object] = {
+        "instrument": make_instrument(),
+        "calendar": MarketSessionCalendar.nse_equity(),
+        "session_open": SESSION_OPEN,
+        "session_close": SESSION_OPEN + timedelta(hours=6, minutes=15),
+        "prior_atr": PRIOR_ATR,
+    }
+    values.update(overrides)
+    return StrategyContext(**values)  # type: ignore[arg-type]
 
 
 def bar(
@@ -113,27 +155,142 @@ def test_detection_composes_with_the_opening_range_indicator() -> None:
     once here - a mismatch in the window's end would otherwise only surface
     much later.
     """
-    opening_bars = (
-        make_candle(SESSION_OPEN, CandleInterval.M5, high="1405", low="1398", close="1400"),
-        make_candle(
-            SESSION_OPEN + CandleInterval.M5.delta,
-            CandleInterval.M5,
-            high="1402",
-            low="1390",
-            close="1395",
-        ),
-        make_candle(
-            SESSION_OPEN + CandleInterval.M5.delta * 2,
-            CandleInterval.M5,
-            high="1412",
-            low="1400",
-            close="1410",
-        ),
-    )
-    measured = opening_range(opening_bars, SESSION_DATE, MarketSessionCalendar.nse_equity())
+    measured = opening_range(OPENING_BARS, SESSION_DATE, MarketSessionCalendar.nse_equity())
     assert (measured.high, measured.low) == (Decimal("1412"), Decimal("1390"))
 
     breakout = make_candle(
         measured.end_at, CandleInterval.M5, high="1418", low="1409", close="1416"
     )
     assert breakout_direction(breakout, measured) is SignalDirection.LONG
+
+
+LONG_BREAK = five_minute(3, high="1418", low="1409", close="1416")
+SHORT_BREAK = five_minute(3, high="1400", low="1384", close="1385")
+NO_BREAK = five_minute(3, high="1408", low="1396", close="1402")
+
+
+class TestOrbSignalLifecycle:
+    """From a session prefix to a Signal, and the reason recorded either way."""
+
+    def test_a_close_above_the_range_produces_a_long_signal(self) -> None:
+        decision = OrbStrategy().evaluate((*OPENING_BARS, LONG_BREAK), context())
+
+        assert decision.reason is OrbReason.LONG_BREAKOUT
+        assert decision.signal is not None
+        assert decision.signal.direction is SignalDirection.LONG
+        assert decision.signal.stop_price == Decimal("1390")
+        assert decision.signal.target_r_multiple == Decimal("2.0")
+        assert decision.signal.signal_bar_start == LONG_BREAK.start_at
+        assert decision.signal.instrument_token == RELIANCE_TOKEN
+        assert decision.signal.reason == "LONG_ORB_BREAKOUT"
+
+    def test_a_close_below_the_range_produces_a_short_signal(self) -> None:
+        """A short stops at the range high - the level that proves it wrong."""
+        decision = OrbStrategy().evaluate((*OPENING_BARS, SHORT_BREAK), context())
+
+        assert decision.reason is OrbReason.SHORT_BREAKOUT
+        assert decision.signal is not None
+        assert decision.signal.direction is SignalDirection.SHORT
+        assert decision.signal.stop_price == Decimal("1412")
+        assert decision.signal.reason == "SHORT_ORB_BREAKOUT"
+
+    def test_a_close_inside_the_range_is_recorded_as_no_breakout(self) -> None:
+        decision = OrbStrategy().evaluate((*OPENING_BARS, NO_BREAK), context())
+        assert decision == OrbDecision(None, OrbReason.NO_BREAKOUT)
+
+    def test_a_bar_still_forming_the_range_reports_the_range_incomplete(self) -> None:
+        """09:15 and 09:20 cannot break a range 09:25 has not finished setting."""
+        for prefix_length in (1, 2):
+            decision = OrbStrategy().evaluate(OPENING_BARS[:prefix_length], context())
+            assert decision == OrbDecision(None, OrbReason.OPENING_RANGE_INCOMPLETE)
+
+    def test_an_empty_prefix_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="session_bars is empty"):
+            OrbStrategy().evaluate((), context())
+
+    def test_a_gap_in_the_opening_window_raises_rather_than_rejecting(self) -> None:
+        """Missing data is not a declined setup.
+
+        Reporting a feed gap as "no breakout" would make it indistinguishable
+        from a quiet morning, and the run would look complete when it was not.
+        """
+        gapped = (OPENING_BARS[0], OPENING_BARS[2], LONG_BREAK)
+        with pytest.raises(IndicatorError, match="missing 09:20:00 IST"):
+            OrbStrategy().evaluate(gapped, context())
+
+
+class TestTargetRepresentation:
+    def test_the_target_needs_an_entry_the_signal_does_not_have(self) -> None:
+        """The whole point of R: one signal, a different target per fill.
+
+        Both targets below come from the same Signal. If it had carried an
+        absolute target price it would have had to presuppose one of them, and
+        the assumed entry would be recoverable from stop and target together.
+        """
+        signal = OrbStrategy().on_bar((*OPENING_BARS, LONG_BREAK), context())
+        assert signal is not None
+
+        def target_for(entry: Decimal) -> Decimal:
+            risk = entry - signal.stop_price
+            return entry + signal.target_r_multiple * risk
+
+        assert target_for(Decimal("1413")) == Decimal("1459")
+        assert target_for(Decimal("1420")) == Decimal("1480")
+
+
+class TestDeterminism:
+    def test_evaluating_the_same_prefix_twice_gives_the_same_decision(self) -> None:
+        strategy = OrbStrategy()
+        prefix = (*OPENING_BARS, LONG_BREAK)
+        assert strategy.evaluate(prefix, context()) == strategy.evaluate(prefix, context())
+
+    def test_a_later_bar_cannot_change_an_earlier_decision(self) -> None:
+        """Re-deciding the 09:30 bar with the rest of the day appended must not
+        move it. The later bars are deliberately extreme."""
+        strategy = OrbStrategy()
+        prefix = (*OPENING_BARS, LONG_BREAK)
+        rest_of_day = (
+            five_minute(4, high="1600", low="1300", close="1500"),
+            five_minute(5, high="1700", low="1200", close="1250"),
+        )
+
+        decided_then = strategy.evaluate(prefix, context())
+        decided_again = strategy.evaluate(prefix, context())
+        assert decided_again == decided_then
+
+        # The extended prefix decides its own last bar, not the earlier one.
+        extended = strategy.evaluate((*prefix, *rest_of_day), context())
+        assert extended.signal is not None
+        assert extended.signal.signal_bar_start == rest_of_day[-1].start_at
+
+
+class TestStrategyConformance:
+    def test_the_strategy_satisfies_the_contract(self) -> None:
+        assert isinstance(OrbStrategy(), Strategy)
+        assert OrbStrategy().name == "orb"
+
+    def test_on_bar_returns_the_signal_alone(self) -> None:
+        prefix = (*OPENING_BARS, LONG_BREAK)
+        strategy = OrbStrategy()
+        assert strategy.on_bar(prefix, context()) == strategy.evaluate(prefix, context()).signal
+        assert strategy.on_bar((*OPENING_BARS, NO_BREAK), context()) is None
+
+
+class TestDecisionConsistency:
+    """A decision cannot misreport itself."""
+
+    def test_a_breakout_reason_without_a_signal_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="claims a breakout but carries no signal"):
+            OrbDecision(None, OrbReason.LONG_BREAKOUT)
+
+    def test_a_rejection_carrying_a_signal_is_rejected(self) -> None:
+        signal = Signal(
+            instrument_token=RELIANCE_TOKEN,
+            direction=SignalDirection.LONG,
+            stop_price=Decimal("1390"),
+            target_r_multiple=Decimal("2"),
+            signal_bar_start=FIRST_DECIDABLE,
+            reason="x",
+        )
+        with pytest.raises(ValueError, match="must not leave a tradable signal"):
+            OrbDecision(signal, OrbReason.NO_BREAKOUT)

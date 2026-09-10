@@ -19,20 +19,42 @@ than a special case, which is why they cannot drift apart:
     That is rejected rather than ignored - silently skipping it would look
     exactly like "no breakout" and hide a wiring error.
 
-This is deliberately only the detection. Whether a detected breakout is worth
-trading - the minimum range, the ATR ceiling, the entry cutoff - and what stop
-and target it implies are separate decisions, and they arrive with the strategy
-itself. Keeping them apart is what lets each be tested against hand-built bars
-where the answer is known in advance.
+Detection is kept separate from the strategy that uses it, so each can be
+tested against hand-built bars where the answer is known in advance.
+
+.. rubric:: The strategy
+
+:class:`OrbStrategy` turns a detected breakout into a :class:`Signal`. It holds
+its parameters and nothing else - no mutable state, no clock, no history beyond
+the session prefix it is handed - so the same bars always produce the same
+signal, whatever order sessions were replayed in.
+
+Every evaluation yields an :class:`OrbDecision`: the signal if one fired, and in
+every case a typed :class:`OrbReason` saying why. Recording why a bar did *not*
+signal is what makes a run explainable - "no trades today" and "every setup was
+rejected as too wide" look identical in an equity curve and are completely
+different facts.
 """
 
 from __future__ import annotations
 
-from app.domain.indicators import OpeningRange
-from app.domain.market.models import Candle, CandleStatus
-from app.domain.strategy.contract import SignalDirection
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import timedelta
+from enum import StrEnum
+from typing import ClassVar
 
-__all__ = ["breakout_direction"]
+from app.domain.indicators import OpeningRange, opening_range
+from app.domain.market.models import Candle, CandleStatus
+from app.domain.strategy.contract import Signal, SignalDirection, StrategyContext
+from app.domain.strategy.params import OrbParams
+
+__all__ = [
+    "OrbDecision",
+    "OrbReason",
+    "OrbStrategy",
+    "breakout_direction",
+]
 
 
 def breakout_direction(candle: Candle, opening_range: OpeningRange) -> SignalDirection | None:
@@ -62,3 +84,131 @@ def breakout_direction(candle: Candle, opening_range: OpeningRange) -> SignalDir
     if candle.close < opening_range.low:
         return SignalDirection.SHORT
     return None
+
+
+class OrbReason(StrEnum):
+    """Why a bar did or did not produce a signal.
+
+    Typed rather than free text because these are compared, counted and
+    asserted on. A rejection tally is one of the first things worth looking at
+    when a run produces fewer trades than expected, and string literals drift
+    apart the moment two of them mean the same thing.
+
+    The values are the strings that reach :attr:`Signal.reason` and the signal
+    log, so they are written in the log's idiom rather than Python's.
+    """
+
+    LONG_BREAKOUT = "LONG_ORB_BREAKOUT"
+    SHORT_BREAKOUT = "SHORT_ORB_BREAKOUT"
+    OPENING_RANGE_INCOMPLETE = "OPENING_RANGE_INCOMPLETE"
+    NO_BREAKOUT = "NO_BREAKOUT"
+
+    @classmethod
+    def for_direction(cls, direction: SignalDirection) -> OrbReason:
+        return cls.LONG_BREAKOUT if direction.is_long else cls.SHORT_BREAKOUT
+
+
+@dataclass(frozen=True, slots=True)
+class OrbDecision:
+    """What the strategy concluded about one bar, and why.
+
+    ``signal`` is ``None`` for every reason other than a breakout. The pair
+    travels together so a caller cannot log the outcome without the explanation
+    - which is exactly what happens when the reason is returned separately and
+    the ``None`` path is the one nobody instruments.
+    """
+
+    signal: Signal | None
+    reason: OrbReason
+
+    def __post_init__(self) -> None:
+        fired = self.reason in (OrbReason.LONG_BREAKOUT, OrbReason.SHORT_BREAKOUT)
+        if fired and self.signal is None:
+            raise ValueError(f"reason {self.reason.value} claims a breakout but carries no signal")
+        if not fired and self.signal is not None:
+            raise ValueError(
+                f"reason {self.reason.value} is a rejection but carries a signal; a rejected "
+                "setup must not leave a tradable signal behind"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class OrbStrategy:
+    """Opening Range Breakout, as a pure function of the session so far.
+
+    The instance holds ``params`` and nothing else. Frozen configuration is not
+    state: the same params and the same bars always give the same signal, which
+    is what lets a result be reproduced from its manifest alone.
+
+    A long stops at the opening range low and a short at its high - the level
+    that would prove the setup wrong, which is a fact about bars that have
+    already closed. The target is ``target_r_multiple`` from the hypothesis,
+    left as a multiple because the entry it is measured from does not exist
+    until the fill.
+    """
+
+    params: OrbParams = field(default_factory=OrbParams)
+
+    name: ClassVar[str] = "orb"
+    version: ClassVar[str] = "1"
+
+    def on_bar(self, session_bars: Sequence[Candle], context: StrategyContext) -> Signal | None:
+        """The contract entry point: the signal, if one fired."""
+        return self.evaluate(session_bars, context).signal
+
+    def evaluate(self, session_bars: Sequence[Candle], context: StrategyContext) -> OrbDecision:
+        """Decide on the last bar of ``session_bars``, with the reason attached.
+
+        ``session_bars`` is the current session's completed bars, oldest first,
+        ending with the bar being decided on.
+
+        A session whose opening window is genuinely incomplete - a bar missing
+        inside 09:15-09:30, or a date the calendar says is not a trading day -
+        raises rather than returning a rejection. That is missing data, not a
+        setup the strategy declined, and quietly reporting it as the latter
+        would make a gap in the feed indistinguishable from a quiet morning.
+        """
+        if not session_bars:
+            raise ValueError(
+                "session_bars is empty; on_bar decides on the bar that just closed, so there "
+                "must be at least one"
+            )
+
+        current = session_bars[-1]
+        window_end = context.session_open + timedelta(minutes=self.params.opening_range_minutes)
+        if current.start_at < window_end:
+            # Still inside the opening window: these bars are forming the range,
+            # and there is nothing yet to break out of.
+            return OrbDecision(None, OrbReason.OPENING_RANGE_INCOMPLETE)
+
+        measured = opening_range(
+            session_bars,
+            context.session_date,
+            context.calendar,
+            opening_range_minutes=self.params.opening_range_minutes,
+        )
+
+        direction = breakout_direction(current, measured)
+        if direction is None:
+            return OrbDecision(None, OrbReason.NO_BREAKOUT)
+
+        return OrbDecision(
+            self._signal(current, measured, direction, context),
+            OrbReason.for_direction(direction),
+        )
+
+    def _signal(
+        self,
+        candle: Candle,
+        measured: OpeningRange,
+        direction: SignalDirection,
+        context: StrategyContext,
+    ) -> Signal:
+        return Signal(
+            instrument_token=context.instrument.instrument_token,
+            direction=direction,
+            stop_price=measured.low if direction.is_long else measured.high,
+            target_r_multiple=self.params.target_r_multiple,
+            signal_bar_start=candle.start_at,
+            reason=OrbReason.for_direction(direction),
+        )
