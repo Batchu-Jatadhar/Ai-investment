@@ -21,6 +21,7 @@ from sqlalchemy import CursorResult, delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.logging import get_logger
+from app.core.time import ensure_utc
 from app.domain.market.models import (
     Candle,
     CandleInterval,
@@ -31,7 +32,7 @@ from app.domain.market.models import (
     MarketTick,
     TickMode,
 )
-from app.domain.market.ports import CandleSaveResult, ConnectionEvent, DataGap
+from app.domain.market.ports import CandlePage, CandleSaveResult, ConnectionEvent, DataGap
 from app.domain.market.quality import DataQualityEvent
 from app.infrastructure.models import (
     CandleRecord,
@@ -498,6 +499,48 @@ class SqlMarketDataRepository:
                 .all()
             )
             return [self._to_candle(row) for row in rows]
+
+    def candles_page(
+        self,
+        instrument_token: int,
+        interval: CandleInterval,
+        start: datetime,
+        end: datetime,
+        *,
+        page_size: int,
+        after: datetime | None = None,
+    ) -> CandlePage:
+        """One keyset page of ``[start, end)``. See the port.
+
+        Reads ``page_size + 1`` rows so that the page knows whether anything
+        follows it: a final page that happens to be exactly full still reports
+        ``next_after=None`` instead of sending the caller for an empty one.
+        """
+        if page_size < 1:
+            raise ValueError(f"page_size must be at least 1, got {page_size}")
+        start, end = ensure_utc(start), ensure_utc(end)
+        if start >= end:
+            raise ValueError(f"start ({start.isoformat()}) must precede end ({end.isoformat()})")
+
+        query = select(CandleRecord).where(
+            CandleRecord.instrument_token == instrument_token,
+            CandleRecord.interval == interval.value,
+            CandleRecord.start_at >= start,
+            CandleRecord.start_at < end,
+        )
+        if after is not None:
+            query = query.where(CandleRecord.start_at > ensure_utc(after))
+
+        with self._read() as session:
+            rows = (
+                session.execute(query.order_by(CandleRecord.start_at).limit(page_size + 1))
+                .scalars()
+                .all()
+            )
+            candles = tuple(self._to_candle(row) for row in rows[:page_size])
+
+        more = len(rows) > page_size
+        return CandlePage(candles, candles[-1].start_at if more else None)
 
     def recent_candles(
         self, instrument_token: int, interval: CandleInterval, count: int

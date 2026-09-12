@@ -116,3 +116,88 @@ def test_an_unsettled_bar_is_refused_and_nothing_is_written(repository) -> None:
     with pytest.raises(ValueError, match="not COMPLETED"):
         repository.save_historical_candles([bar(0), bar(1, status=CandleStatus.IN_PROGRESS)])
     assert stored(repository) == []
+
+
+# --------------------------------------------------------------------------- #
+# complete paginated range reads
+# --------------------------------------------------------------------------- #
+
+
+def read_all(repository, start: datetime, end: datetime, page_size: int) -> list[list[Candle]]:  # noqa: ANN001
+    """Follow next_after to the end, returning each page."""
+    pages: list[list[Candle]] = []
+    after = None
+    while True:
+        page = repository.candles_page(
+            RELIANCE_TOKEN, M1, start, end, page_size=page_size, after=after
+        )
+        pages.append(list(page.candles))
+        if page.next_after is None:
+            return pages
+        after = page.next_after
+
+
+def test_more_than_five_thousand_bars_page_back_complete_and_in_order(repository) -> None:  # noqa: ANN001
+    count = 5_201
+    repository.save_historical_candles([bar(i) for i in range(count)])
+    end = START + timedelta(minutes=count)
+
+    # The capped read this replaces for history stops short without saying so.
+    assert len(repository.candles_in_range(RELIANCE_TOKEN, M1, START, end)) == 5_000
+
+    pages = read_all(repository, START, end, page_size=2_000)
+
+    assert [len(page) for page in pages] == [2_000, 2_000, 1_201]
+    starts = [c.start_at for page in pages for c in page]
+    # Every minute exactly once, ascending: no gap, no duplicate.
+    assert starts == [START + timedelta(minutes=i) for i in range(count)]
+    assert read_all(repository, START, end, page_size=2_000) == pages
+
+
+def test_an_exactly_full_last_page_ends_the_read(repository) -> None:  # noqa: ANN001
+    repository.save_historical_candles([bar(i) for i in range(4)])
+    end = START + timedelta(minutes=4)
+
+    first = repository.candles_page(RELIANCE_TOKEN, M1, START, end, page_size=2)
+    second = repository.candles_page(
+        RELIANCE_TOKEN, M1, START, end, page_size=2, after=first.next_after
+    )
+
+    assert (len(first.candles), first.next_after) == (2, START + timedelta(minutes=1))
+    assert (len(second.candles), second.next_after) == (2, None)
+
+
+def test_pages_respect_the_half_open_bounds_and_the_series_key(repository) -> None:  # noqa: ANN001
+    five_minute = bar(0, interval=CandleInterval.M5, end_at=START + CandleInterval.M5.delta)
+    other_instrument = bar(3, instrument_token=408065)
+    repository.save_historical_candles(
+        [*(bar(i) for i in range(10)), other_instrument, five_minute]
+    )
+
+    pages = read_all(
+        repository, START + timedelta(minutes=2), START + timedelta(minutes=7), page_size=3
+    )
+
+    assert [[c.start_at for c in page] for page in pages] == [
+        [START + timedelta(minutes=i) for i in (2, 3, 4)],
+        [START + timedelta(minutes=i) for i in (5, 6)],
+    ]
+    assert all(c.instrument_token == RELIANCE_TOKEN and c.interval is M1 for p in pages for c in p)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "page_size"),
+    [
+        pytest.param(START, START + timedelta(minutes=5), 0, id="zero-page-size"),
+        pytest.param(START, START, 10, id="empty-range"),
+        pytest.param(START.replace(tzinfo=None), START + timedelta(minutes=5), 10, id="naive"),
+    ],
+)
+def test_invalid_page_requests_are_rejected(
+    repository,  # noqa: ANN001
+    start: datetime,
+    end: datetime,
+    page_size: int,
+) -> None:
+    with pytest.raises(ValueError):
+        repository.candles_page(RELIANCE_TOKEN, M1, start, end, page_size=page_size)

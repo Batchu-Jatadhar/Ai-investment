@@ -32,6 +32,7 @@ from app.domain.market.models import (
 from app.domain.market.quality import DataQualityEvent
 
 __all__ = [
+    "CandlePage",
     "CandleSaveResult",
     "ConnectionEvent",
     "ConnectionEventType",
@@ -151,6 +152,20 @@ class CandleSaveResult:
         return len(self.conflicts)
 
 
+@dataclass(frozen=True, slots=True)
+class CandlePage:
+    """One page of a range read, oldest first.
+
+    ``next_after`` is the continuation: pass it back as ``after`` to read the
+    next page. It is ``None`` only when nothing is left in the range, so a
+    caller that stops at ``None`` has read every bar - never a silently
+    truncated subset.
+    """
+
+    candles: tuple[Candle, ...]
+    next_after: datetime | None
+
+
 @runtime_checkable
 class MarketDataProvider(Protocol):
     """A live or replayed source of market data."""
@@ -253,6 +268,25 @@ class MarketDataRepository(Protocol):
         end: datetime,
         limit: int = 5_000,
     ) -> list[Candle]: ...
+
+    def candles_page(
+        self,
+        instrument_token: int,
+        interval: CandleInterval,
+        start: datetime,
+        end: datetime,
+        *,
+        page_size: int,
+        after: datetime | None = None,
+    ) -> CandlePage:
+        """Bars in ``[start, end)`` starting strictly after ``after``, oldest first.
+
+        Keyset pagination on ``start_at``, which is unique per instrument and
+        interval, so pages neither skip nor repeat a bar. Unlike
+        :meth:`candles_in_range` there is no default cap to fall silently under:
+        the caller names the page size and follows ``next_after`` to the end.
+        """
+        ...
 
     def recent_candles(
         self, instrument_token: int, interval: CandleInterval, count: int
