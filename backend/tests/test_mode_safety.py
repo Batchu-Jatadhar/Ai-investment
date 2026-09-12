@@ -174,12 +174,49 @@ class TestNoOrderCapabilityInSource:
         "def cancel_order",
         "def exit_order",
         "def execute_trade",
+        "def submit_order",
         "place_order(",
         "modify_order(",
         "cancel_order(",
+        "execute_trade(",
+        "submit_order(",
         ".orders(",
         "/orders",
     )
+
+    #: Every module on the historical backfill command's path.
+    BACKFILL_PATH = (
+        "runtime/historical_backfill.py",
+        "services/historical_ingestion.py",
+        "adapters/zerodha/historical.py",
+        "adapters/zerodha/pacing.py",
+    )
+
+    def test_the_backfill_path_sends_no_writes_and_reaches_no_trading_code(self) -> None:
+        """Read-only by construction: the backfill modules name no mutating HTTP
+        method and import no strategy, backtest, execution, order or AI code. The
+        request-level proof - every call a historical GET - is in the CLI tests."""
+        root = pathlib.Path(__file__).resolve().parents[1] / "app"
+        forbidden = (
+            '"POST"',
+            '"PUT"',
+            '"PATCH"',
+            '"DELETE"',
+            "app.domain.backtest",
+            "app.domain.strategy",
+            "app.domain.execution",
+            "app.domain.orders",
+            "app.domain.broker",
+            "app.domain.ai",
+            "tradingview",
+        )
+        offenders = [
+            f"{module}: {needle}"
+            for module in self.BACKFILL_PATH
+            for needle in forbidden
+            if needle.lower() in (root / module).read_text(encoding="utf-8").lower()
+        ]
+        assert offenders == [], f"the backfill path must stay read-only: {offenders}"
 
     @staticmethod
     def _sources() -> list[pathlib.Path]:
