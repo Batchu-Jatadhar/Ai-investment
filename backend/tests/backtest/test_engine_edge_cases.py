@@ -21,6 +21,17 @@ It reaches the stop and trades through the target, so its 1-minute bars decide.
                    costs 30.34 + 52.06                          =     82.40
                    net -1005.00 - 82.40                         = -1,087.40
     target first   gross 1,995.00, costs 83.25, net 1,911.75 (as in test_engine)
+
+.. rubric:: Gap through the stop - the 09:45 bar opens at 985.00, below 990.00
+
+    fill           the open, 985.00, less 1 tick                =    984.95
+    gross          (984.95 - 1000.00) x 100                     = -1,505.00
+    exit costs     turnover 98,495.00: brokerage 20.00 (capped),
+                   STT 24.62375 -> 24.62, exchange 3.0237965 -> 3.02,
+                   SEBI 0.10, GST 18% x 23.12 = 4.1616 -> 4.16  =     51.90
+    costs          30.34 + 51.90                                =     82.24
+    net            -1505.00 - 82.24                             = -1,587.24
+    ending equity  500,000.00 - 1,587.24                        = 498,412.76
 """
 
 from __future__ import annotations
@@ -31,9 +42,18 @@ from decimal import Decimal
 import pytest
 
 from app.domain.backtest import engine
+from app.domain.backtest.config import SlippageConfig
+from app.domain.backtest.execution import (
+    ExecutionIntent,
+    ExecutionStatus,
+    UnexecutableBarError,
+    resolve_entry_fill,
+)
 from app.domain.backtest.models import AmbiguityResolution, FillReason
 from app.domain.backtest.result import BacktestResult
 from app.domain.market.models import Candle, CandleInterval
+from app.domain.strategy.contract import SignalDirection
+from tests.backtest.conftest import make_candle
 from tests.backtest.test_engine import (
     NO_TRADE_1M,
     NO_TRADE_5M,
@@ -171,3 +191,88 @@ def test_execution_reads_only_the_next_bar_and_its_own_minutes(
         (ist(TRADE_OPEN, "09:40"), ()),
         (ist(TRADE_OPEN, "09:45"), STOP_FIRST_1M),
     ]
+
+
+GAP_5M = bars(TRADE_OPEN, M5, [("09:45", "985.00", "987.00", "980.00", "982.00")])
+
+
+class TestGapsAndMissingExecution:
+    def test_a_gap_through_the_stop_fills_at_the_open_not_the_stop(self) -> None:
+        result = trade_day(ENTRY_5M + GAP_5M, ())
+        (trade,) = result.trades
+        assert trade.exit_reason is FillReason.STOP
+        assert trade.ambiguity is AmbiguityResolution.UNAMBIGUOUS
+        assert trade.exit.reference_price == Decimal("985.00")
+        assert trade.exit.price == Decimal("984.95")
+        assert trade.exit.occurred_at == ist(TRADE_OPEN, "09:45")  # the opening print
+        assert trade.exit.costs == Decimal("51.90")
+        assert (trade.gross_pnl, trade.costs, trade.net_pnl) == (
+            Decimal("-1505.00"),
+            Decimal("82.24"),
+            Decimal("-1587.24"),
+        )
+        assert result.equity_curve[-1].equity == Decimal("498412.76")
+
+    def test_a_signal_with_no_bar_after_it_is_logged_and_never_traded(self) -> None:
+        """The gap bar also closes below the range: a SHORT on the session's last
+        bar. It stays in the log, and no second trade is fabricated for it."""
+        result = trade_day(ENTRY_5M + GAP_5M, ())
+        assert [(r.signal.direction, r.signal.signal_bar_start) for r in result.signal_log] == [
+            (SignalDirection.LONG, ist(TRADE_OPEN, "09:35")),
+            (SignalDirection.SHORT, ist(TRADE_OPEN, "09:45")),
+        ]
+        assert len(result.trades) == 1
+
+        # The explicit outcome for that signal, from the resolver the engine uses.
+        short = result.signal_log[1].signal
+        intent = ExecutionIntent(short, 1, ist(TRADE_OPEN, "09:50"))
+        outcome = resolve_entry_fill(
+            intent, None, tick_size=Decimal("0.05"), slippage=SlippageConfig()
+        )
+        assert (outcome.status, outcome.fill) == (ExecutionStatus.NO_EXECUTION_BAR, None)
+
+    @pytest.mark.parametrize(
+        ("after_signal", "status", "bar_at"),
+        [
+            pytest.param(
+                (make_candle(ist(TRADE_OPEN, "09:40"), M5, open_="999.95", volume=0),),
+                ExecutionStatus.NO_VOLUME,
+                "09:40",
+                id="entry-bar-without-volume",
+            ),
+            pytest.param(
+                ENTRY_5M
+                + (
+                    make_candle(
+                        ist(TRADE_OPEN, "09:45"),
+                        M5,
+                        open_="1006.00",
+                        high="1006.00",
+                        low="1006.00",
+                        close="1006.00",
+                        volume=0,
+                    ),
+                ),
+                ExecutionStatus.NO_RANGE,
+                "09:45",
+                id="held-bar-that-never-traded",
+            ),
+        ],
+    )
+    def test_an_unexecutable_bar_stops_the_run_explicitly(
+        self, after_signal: tuple[Candle, ...], status: ExecutionStatus, bar_at: str
+    ) -> None:
+        messages = []
+        for _ in range(2):
+            with pytest.raises(UnexecutableBarError) as raised:
+                trade_day(after_signal, ())
+            assert raised.value.status is status
+            assert raised.value.bar_start == ist(TRADE_OPEN, bar_at)
+            messages.append(str(raised.value))
+        assert messages[0] == messages[1]
+
+    def test_a_position_still_open_when_the_session_runs_out_is_an_error(self) -> None:
+        """The day's bars stop at 09:40, long before the 15:15 hard exit. The
+        engine refuses rather than inventing a closing price."""
+        with pytest.raises(ValueError, match="still held when its bars ran out"):
+            trade_day(ENTRY_5M, ())
