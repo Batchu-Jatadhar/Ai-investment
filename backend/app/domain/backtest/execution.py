@@ -131,12 +131,17 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, time
 from decimal import Decimal
-from enum import StrEnum
 
 from app.core.time import ensure_utc, to_ist
 from app.domain.backtest.config import NO_COSTS, CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.backtest.costs import leg_charges
-from app.domain.backtest.models import AmbiguityResolution, Fill, FillReason, OrderSide
+from app.domain.backtest.models import (
+    AmbiguityResolution,
+    ExecutionStatus,
+    Fill,
+    FillReason,
+    OrderSide,
+)
 from app.domain.market.models import Candle, CandleInterval, CandleStatus
 from app.domain.market.ports import DataGap
 from app.domain.strategy.contract import Signal, SignalDirection
@@ -153,25 +158,6 @@ __all__ = [
     "resolve_stop_fill",
     "resolve_target_fill",
 ]
-
-
-class ExecutionStatus(StrEnum):
-    """What became of an attempt to execute.
-
-    One enum for both axes on purpose: a run's execution log wants a single
-    column it can count, not a status that sometimes lives in a return value
-    and sometimes in an exception type.
-    """
-
-    FILLED = "filled"
-    #: The signal had no bar to be entered on - the session ended first.
-    NO_EXECUTION_BAR = "no_execution_bar"
-    #: The bar recorded no trades, so no price on it was ever transacted.
-    NO_VOLUME = "no_volume"
-    #: The bar neither moved nor traded: a placeholder, not a bar.
-    NO_RANGE = "no_range"
-    #: The bar overlaps a recorded gap in the feed, so its prices are suspect.
-    INSIDE_DATA_GAP = "inside_data_gap"
 
 
 class UnexecutableBarError(ValueError):

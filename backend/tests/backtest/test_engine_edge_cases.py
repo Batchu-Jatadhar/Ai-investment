@@ -430,3 +430,40 @@ def test_the_engine_flattens_an_open_position_at_the_hard_exit() -> None:
         Decimal("912.03"),
     )
     assert result.equity_curve[-1].equity == Decimal("500912.03")
+
+
+class TestUnexecutedSignalOutcomes:
+    """Generated, accepted, executed and NO_EXECUTION_BAR are each visible in the
+    result rather than inferred from which trades happen to be missing."""
+
+    def test_a_missing_next_bucket_is_recorded_as_no_execution_bar(self) -> None:
+        result = trade_day(AFTER_A_MISSING_BUCKET_5M, ())
+        (record,) = result.signal_log
+        assert record.accepted is True
+        assert record.execution_status is ExecutionStatus.NO_EXECUTION_BAR
+        assert result.trades == ()
+
+    def test_each_signal_carries_what_became_of_it(self) -> None:
+        """The long fills; the short on the session's last bar has nowhere to go."""
+        result = trade_day(ENTRY_5M + GAP_5M, ())
+        assert [(r.signal.direction, r.execution_status) for r in result.signal_log] == [
+            (SignalDirection.LONG, ExecutionStatus.FILLED),
+            (SignalDirection.SHORT, ExecutionStatus.NO_EXECUTION_BAR),
+        ]
+        assert [t.direction for t in result.trades] == [SignalDirection.LONG]
+        summary = result.canonical()
+        assert (
+            summary["signal_count"],
+            summary["accepted_signal_count"],
+            summary["executed_signal_count"],
+            summary["no_execution_bar_signal_count"],
+            summary["trade_count"],
+        ) == ("2", "2", "1", "1", "1")
+
+    def test_recorded_outcomes_serialize_deterministically(self) -> None:
+        first = trade_day(ENTRY_5M + GAP_5M, ())
+        second = trade_day(ENTRY_5M + GAP_5M, ())
+        rendered = json.dumps(asdict(first), default=str, sort_keys=True)
+        assert rendered == json.dumps(asdict(second), default=str, sort_keys=True)
+        assert '"execution_status": "no_execution_bar"' in rendered
+        assert first.canonical() == second.canonical()

@@ -30,6 +30,7 @@ from app.domain.strategy.contract import Signal, SignalDirection
 __all__ = [
     "AmbiguityResolution",
     "EquityPoint",
+    "ExecutionStatus",
     "Fill",
     "FillReason",
     "OrderSide",
@@ -60,6 +61,29 @@ class OrderSide(StrEnum):
     @classmethod
     def entry_for(cls, direction: SignalDirection) -> OrderSide:
         return cls.BUY if direction.is_long else cls.SELL
+
+
+class ExecutionStatus(StrEnum):
+    """What became of an attempt to execute.
+
+    One enum for both axes on purpose: a run's execution log wants a single
+    column it can count, not a status that sometimes lives in a return value
+    and sometimes in an exception type.
+
+    Defined here rather than in ``execution.py`` so :class:`SignalRecord` can
+    carry it without an import cycle; ``execution`` re-exports it.
+    """
+
+    FILLED = "filled"
+    #: The signal had no bar to be entered on: the session ended first, or the
+    #: exact next bucket is missing from the data.
+    NO_EXECUTION_BAR = "no_execution_bar"
+    #: The bar recorded no trades, so no price on it was ever transacted.
+    NO_VOLUME = "no_volume"
+    #: The bar neither moved nor traded: a placeholder, not a bar.
+    NO_RANGE = "no_range"
+    #: The bar overlaps a recorded gap in the feed, so its prices are suspect.
+    INSIDE_DATA_GAP = "inside_data_gap"
 
 
 class FillReason(StrEnum):
@@ -251,14 +275,26 @@ class SignalRecord:
     invariant, and this log is what makes it testable.
 
     In Phase 2 every record is accepted by ``"strategy"``.
+
+    ``execution_status`` says what became of an accepted signal once the engine
+    tried to enter it: ``FILLED``, or ``NO_EXECUTION_BAR`` when its exact next
+    bar did not exist - so "signalled but never traded" is recorded rather than
+    inferred from a missing trade. ``None`` means no entry was attempted: the
+    signal was rejected, or it arrived while a position was already held.
     """
 
     signal: Signal
     accepted: bool
     decision_reason: str
     decided_by: str = "strategy"
+    execution_status: ExecutionStatus | None = None
 
     def __post_init__(self) -> None:
+        if not self.accepted and self.execution_status is not None:
+            raise ValueError(
+                "a rejected signal was never sent for execution, so it cannot have "
+                f"execution_status {self.execution_status.value}"
+            )
         if not self.decision_reason.strip():
             raise ValueError("decision_reason must say why the signal was accepted or rejected")
         if not self.decided_by.strip():

@@ -18,7 +18,13 @@ from decimal import Decimal
 
 from app.core.canonical import canonical_decimal
 from app.domain.backtest.metrics import PerformanceReport, evaluate_performance
-from app.domain.backtest.models import EquityPoint, RunManifest, SignalRecord, Trade
+from app.domain.backtest.models import (
+    EquityPoint,
+    ExecutionStatus,
+    RunManifest,
+    SignalRecord,
+    Trade,
+)
 
 __all__ = ["BacktestResult"]
 
@@ -126,8 +132,14 @@ class BacktestResult:
         def render(value: Decimal | None) -> str:
             return canonical_decimal(value) if value is not None else ""
 
+        def signals_with(status: ExecutionStatus) -> str:
+            return str(sum(1 for r in self.signal_log if r.execution_status is status))
+
         summary = {
+            "accepted_signal_count": str(sum(1 for r in self.signal_log if r.accepted)),
             "engine_version": self.manifest.engine_version,
+            "executed_signal_count": signals_with(ExecutionStatus.FILLED),
+            "no_execution_bar_signal_count": signals_with(ExecutionStatus.NO_EXECUTION_BAR),
             "input_fingerprint": self.manifest.input_fingerprint,
             "measured": str(self.performance is not None).lower(),
             "signal_count": str(len(self.signal_log)),

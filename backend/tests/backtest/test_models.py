@@ -13,6 +13,7 @@ from app.core.time import NaiveDatetimeError
 from app.domain.backtest.models import (
     AmbiguityResolution,
     EquityPoint,
+    ExecutionStatus,
     Fill,
     FillReason,
     OrderSide,
@@ -298,6 +299,20 @@ class TestSignalRecord:
         )
         assert record.accepted is False
         assert record.decided_by == "risk"
+
+    def test_no_execution_is_recorded_until_the_engine_attempts_one(self) -> None:
+        record = SignalRecord(signal=make_signal(), accepted=True, decision_reason="taken")
+        assert record.execution_status is None
+
+    def test_a_rejected_signal_cannot_carry_an_execution_status(self) -> None:
+        with pytest.raises(ValueError, match="never sent for execution"):
+            SignalRecord(
+                signal=make_signal(),
+                accepted=False,
+                decision_reason="daily loss limit reached",
+                decided_by="risk",
+                execution_status=ExecutionStatus.NO_EXECUTION_BAR,
+            )
 
     def test_empty_reason_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="decision_reason must say why"):

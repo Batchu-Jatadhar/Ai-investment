@@ -21,7 +21,10 @@ each of them exactly what it may see at that moment.
 
 Every signal is written to the signal log, including one that fires while a
 position is already held or on the session's last bar and so is never traded.
-The log records what the strategy said; the trades record what execution did.
+Each entry attempt stamps its outcome on the record's ``execution_status``
+(``FILLED`` or ``NO_EXECUTION_BAR``); a signal that arrived while a position was
+held keeps ``None``. The log records what the strategy said and what became of
+it; the trades record only what actually executed.
 
 .. rubric:: What is deliberately not here
 
@@ -32,12 +35,15 @@ share anything.
 
 Data that cannot establish a fill raises :class:`UnexecutableBarError` out of
 the run. Session quarantine is not implemented yet, so ``quarantined_sessions``
-is reported as zero.
+is reported as zero. ``BacktestInput`` carries no recorded feed gaps either, so
+the resolvers' ``INSIDE_DATA_GAP`` check is never exercised by a run; both
+arrive with historical data.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from itertools import groupby
@@ -54,7 +60,7 @@ from app.domain.backtest.models import Fill, RunManifest, SignalRecord
 from app.domain.backtest.portfolio import Portfolio
 from app.domain.backtest.result import BacktestResult
 from app.domain.market.models import Candle
-from app.domain.strategy.contract import Signal, Strategy, StrategyContext
+from app.domain.strategy.contract import Strategy, StrategyContext
 from app.domain.strategy.orb import OrbStrategy
 
 __all__ = ["ENGINE_VERSION", "run_backtest"]
@@ -109,27 +115,30 @@ def run_backtest(
         )
         minutes = sessions_1m.get(day, ())
 
-        pending: Signal | None = None
+        #: Index into ``signal_log`` of the signal awaiting its entry bar.
+        pending: int | None = None
         held: tuple[ExecutionIntent, Fill] | None = None
 
         for index, bar in enumerate(bars):
             if pending is not None:
-                entry_bar_start = pending.signal_bar_start + interval
+                signal = signal_log[pending].signal
+                entry_bar_start = signal.signal_bar_start + interval
                 next_bar = bar if bar.start_at == entry_bar_start else None
                 # Sized from the price the entry actually fills at, which is not
                 # known until the bar opens: probe the fill for one share, size
                 # from its price, then fill the real quantity.
                 probe = resolve_entry_fill(
-                    ExecutionIntent(pending, 1, entry_bar_start),
+                    ExecutionIntent(signal, 1, entry_bar_start),
                     next_bar,
                     tick_size=tick_size,
                     slippage=slippage,
                 )
+                signal_log[pending] = replace(signal_log[pending], execution_status=probe.status)
                 if probe.fill is not None:
                     quantity = portfolio.size_for(
                         probe.fill.price, lot_size=data.instrument.lot_size
                     )
-                    intent = ExecutionIntent(pending, quantity, entry_bar_start)
+                    intent = ExecutionIntent(signal, quantity, entry_bar_start)
                     entry = resolve_entry_fill(
                         intent,
                         next_bar,
@@ -168,16 +177,25 @@ def run_backtest(
                     portfolio = portfolio.close(exit_fill, ambiguity=resolution.ambiguity)
                     held = None
 
-            signal = active.on_bar(bars[: index + 1], context)
-            if signal is None:
+            decided = active.on_bar(bars[: index + 1], context)
+            if decided is None:
                 continue
             signal_log.append(
-                SignalRecord(signal=signal, accepted=True, decision_reason=signal.reason)
+                SignalRecord(signal=decided, accepted=True, decision_reason=decided.reason)
             )
             if held is None:
-                # Entered at the next bar's open. A signal on the session's last
-                # bar has no next bar, and ``pending`` dies with the session.
-                pending = signal
+                pending = len(signal_log) - 1  # entered at the next bar's open
+
+        if pending is not None:
+            # Signalled on the session's last bar: there is no next bar.
+            record = signal_log[pending]
+            outcome = resolve_entry_fill(
+                ExecutionIntent(record.signal, 1, record.signal.signal_bar_start + interval),
+                None,
+                tick_size=tick_size,
+                slippage=slippage,
+            )
+            signal_log[pending] = replace(record, execution_status=outcome.status)
 
         if held is not None:
             raise ValueError(
