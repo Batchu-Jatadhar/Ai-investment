@@ -4,7 +4,8 @@ Implements only what market data needs:
 
 *   the login URL and the ``request_token`` -> ``access_token`` exchange,
 *   a profile call used purely to verify that a token is live,
-*   the daily instruments dump.
+*   the daily instruments dump,
+*   historical candles (``GET /instruments/historical/...``).
 
 **There are no order methods here and none may be added in this phase.** No
 ``place_order``, ``modify_order`` or ``cancel_order`` exists anywhere in this
@@ -18,6 +19,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -32,9 +34,14 @@ from app.adapters.zerodha.errors import (
     ZerodhaProtocolError,
     classify_response,
 )
+from app.adapters.zerodha.historical import (
+    historical_path,
+    ist_query_time,
+    parse_historical_candles,
+)
 from app.core.logging import get_logger
-from app.core.time import utc_now
-from app.domain.market.models import Instrument
+from app.core.time import ensure_utc, utc_now
+from app.domain.market.models import Candle, CandleInterval, Instrument
 
 logger = get_logger(__name__)
 
@@ -245,13 +252,19 @@ class ZerodhaRestClient:
         *,
         authenticated: bool = True,
         data: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
         expect_json: bool = True,
+        decimal_json: bool = False,
     ) -> Any:
         client = await self._http()
         url = f"{self._api_root}{path}"
         try:
             response = await client.request(
-                method, url, headers=self._headers(authenticated=authenticated), data=data
+                method,
+                url,
+                headers=self._headers(authenticated=authenticated),
+                data=data,
+                params=params,
             )
         except httpx.HTTPError as exc:
             raise ZerodhaNetworkError(
@@ -266,7 +279,11 @@ class ZerodhaRestClient:
             return response.text
 
         try:
-            body = response.json()
+            # decimal_json keeps prices exact: the default parser would turn them
+            # into binary floats before any code here could see them.
+            body = (
+                json.loads(response.text, parse_float=Decimal) if decimal_json else response.json()
+            )
         except ValueError as exc:
             raise ZerodhaProtocolError("response was not valid JSON", path=path) from exc
 
@@ -348,6 +365,56 @@ class ZerodhaRestClient:
             extra={"count": len(instruments), "exchange": exchange or "ALL"},
         )
         return instruments
+
+    # ------------------------------------------------------------------ #
+    # historical candles
+    # ------------------------------------------------------------------ #
+
+    async def fetch_historical_candles(
+        self,
+        instrument: Instrument,
+        interval: CandleInterval,
+        *,
+        start: datetime,
+        end: datetime,
+        as_of: datetime,
+    ) -> list[Candle]:
+        """Completed historical candles for ``instrument`` in ``[start, end)``.
+
+        One GET, one window: splitting long ranges, pacing and retrying are the
+        caller's. ``continuous`` and ``oi`` are never sent - they apply to
+        futures and options, not NSE cash equity.
+
+        ``as_of`` must be supplied rather than read from a clock, so the same
+        call over the same response always yields the same candles. Bars ending
+        after it are dropped as unfinished.
+
+        Arguments are checked before any request: an unsupported interval, a
+        naive datetime or an empty window raises ``ValueError``.
+        """
+        path = historical_path(instrument.instrument_token, interval)
+        if ensure_utc(start) >= ensure_utc(end):
+            raise ValueError(f"start ({start.isoformat()}) must precede end ({end.isoformat()})")
+        ensure_utc(as_of)
+
+        data = await self._request(
+            "GET",
+            path,
+            params={"from": ist_query_time(start), "to": ist_query_time(end)},
+            decimal_json=True,
+        )
+        candles = parse_historical_candles(
+            data, instrument=instrument, interval=interval, start=start, end=end, as_of=as_of
+        )
+        logger.info(
+            "historical_candles_fetched",
+            extra={
+                "instrument_token": instrument.instrument_token,
+                "interval": interval.value,
+                "count": len(candles),
+            },
+        )
+        return candles
 
     # ------------------------------------------------------------------ #
 
