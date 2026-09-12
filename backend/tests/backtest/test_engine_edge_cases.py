@@ -36,7 +36,8 @@ It reaches the stop and trades through the target, so its 1-minute bars decide.
 
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -57,6 +58,7 @@ from tests.backtest.conftest import make_candle
 from tests.backtest.test_engine import (
     NO_TRADE_1M,
     NO_TRADE_5M,
+    TRADE_1M,
     TRADE_5M,
     TRADE_OPEN,
     bars,
@@ -276,3 +278,57 @@ class TestGapsAndMissingExecution:
         engine refuses rather than inventing a closing price."""
         with pytest.raises(ValueError, match="still held when its bars ran out"):
             trade_day(ENTRY_5M, ())
+
+
+def three_days_later(candles: tuple[Candle, ...]) -> tuple[Candle, ...]:
+    """Friday's bars moved to Monday 2026-08-24, prices untouched."""
+    shift = timedelta(days=3)
+    return tuple(replace(c, start_at=c.start_at + shift, end_at=c.end_at + shift) for c in candles)
+
+
+MONDAY_5M, MONDAY_1M = three_days_later(TRADE_5M), three_days_later(TRADE_1M)
+
+
+class TestMultiSession:
+    """Thursday is ATR history. Friday signals on its last bar and cannot
+    execute. Monday replays the full Phase 2.6.1 trade session.
+
+    Monday's ATR now includes Friday's five bars: true ranges 16, 8, 8, 4.5 and
+    4 fold 10 down to about 9.29, and 1.5 x 9.29 is still wider than the 12.00
+    opening range, so Monday trades exactly as the original fixture did."""
+
+    RUN = synthetic_input(
+        NO_TRADE_5M + SETUP_5M + MONDAY_5M,
+        NO_TRADE_1M + COVERAGE_1M + MONDAY_1M,
+    )
+    MONDAY = ist(TRADE_OPEN, "09:15") + timedelta(days=3)
+
+    def test_sessions_aggregate_and_nothing_leaks_between_them(self) -> None:
+        result = run(self.RUN)
+
+        (trade,) = result.trades
+        # Friday's unexecuted signal is not carried into Monday's 09:15 bar.
+        assert trade.entry.occurred_at == self.MONDAY + timedelta(minutes=25)  # 09:40
+        assert trade.exit.occurred_at == self.MONDAY + timedelta(minutes=40)  # 09:55
+        assert (trade.entry.price, trade.exit.price, trade.entry.quantity) == (
+            Decimal("1000.00"),
+            Decimal("1019.95"),
+            100,
+        )
+        assert trade.net_pnl == Decimal("1911.75")
+        assert [(p.at, p.equity) for p in result.equity_curve] == [
+            (ist(TRADE_OPEN, "09:15") - timedelta(days=1), Decimal("500000")),
+            (trade.exit.occurred_at, Decimal("501911.75")),
+        ]
+        assert result.performance is not None
+        assert result.performance.portfolio.net_pnl == Decimal("1911.75")
+        assert result.performance.portfolio.active_days == 1
+
+    def test_signal_log_keeps_the_unexecuted_signal_and_trades_hold_only_fills(self) -> None:
+        result = run(self.RUN)
+        assert [r.signal.signal_bar_start for r in result.signal_log] == [
+            ist(TRADE_OPEN, "09:35"),
+            self.MONDAY + timedelta(minutes=20),
+        ]
+        assert all(r.accepted for r in result.signal_log)
+        assert [t.entry.occurred_at for t in result.trades] == [self.MONDAY + timedelta(minutes=25)]
