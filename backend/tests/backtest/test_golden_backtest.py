@@ -79,14 +79,16 @@ accepted, its entry bucket does not exist, and it is recorded NO_EXECUTION_BAR.
 from __future__ import annotations
 
 import inspect
+import json
 import types
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from app.domain.backtest import engine
-from app.domain.backtest.config import NSE_INTRADAY_EQUITY
+from app.domain.backtest.config import NSE_INTRADAY_EQUITY, SlippageConfig
 from app.domain.backtest.engine import run_backtest
 from app.domain.backtest.input import BacktestInput
 from app.domain.backtest.models import ExecutionStatus, FillReason, OrderSide
@@ -378,3 +380,35 @@ def test_exposing_one_future_bar_to_the_strategy_breaks_the_golden_run() -> None
     # Seeing 09:35 while deciding 09:30, Friday's long fires a bar early and its
     # entry bucket no longer lines up, so the profitable trade never happens.
     assert leaked.trades == ()
+
+
+def artifact(result: BacktestResult) -> bytes:
+    """The whole result, serialized, minus the one wall-clock field."""
+    rendered = asdict(result)
+    del rendered["manifest"]["generated_at"]
+    return json.dumps(rendered, default=str, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_repeat_runs_produce_a_byte_identical_result_artifact() -> None:
+    first = run_golden(generated_at=datetime(2026, 9, 1, tzinfo=UTC))
+    second = run_golden(generated_at=datetime(2031, 1, 1, 12, 34, tzinfo=UTC))
+
+    assert artifact(first) == artifact(second)
+    assert first.canonical() == second.canonical()
+    # generated_at is the only difference between the two runs.
+    assert first != second
+    assert replace(second, manifest=first.manifest) == first
+
+
+def test_the_fingerprint_tracks_data_strategy_and_config() -> None:
+    baseline = golden_input().fingerprint()
+    assert golden_input().fingerprint() == baseline
+
+    moved = FRI_5M[6]  # the 09:45 bar
+    data_changed = WED_5M + THU_5M + FRI_5M[:6] + (replace(moved, high=Decimal("1037.05")),)
+    assert golden_input(candles_5m=data_changed + FRI_5M[7:] + MON_5M).fingerprint() != baseline
+    assert (
+        golden_input(strategy_params=OrbParams(target_r_multiple=Decimal("3.0"))).fingerprint()
+        != baseline
+    )
+    assert golden_input(slippage_config=SlippageConfig(adverse_ticks=2)).fingerprint() != baseline
