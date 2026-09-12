@@ -32,6 +32,7 @@ from app.domain.market.models import (
 from app.domain.market.quality import DataQualityEvent
 
 __all__ = [
+    "CandleSaveResult",
     "ConnectionEvent",
     "ConnectionEventType",
     "DataGap",
@@ -130,6 +131,26 @@ class TickBatch:
 StreamEvent = TickBatch | ConnectionEvent | DataGap
 
 
+@dataclass(frozen=True, slots=True)
+class CandleSaveResult:
+    """What a conflict-safe candle save did with each bar it was given.
+
+    ``conflicts`` holds the *incoming* bars that were refused because a
+    different bar is already stored under the same
+    ``(instrument_token, interval, start_at)``. The stored bar is left exactly
+    as it was; resolving the disagreement is a decision for a person, not for a
+    save.
+    """
+
+    inserted: int
+    identical: int
+    conflicts: tuple[Candle, ...] = ()
+
+    @property
+    def conflict_count(self) -> int:
+        return len(self.conflicts)
+
+
 @runtime_checkable
 class MarketDataProvider(Protocol):
     """A live or replayed source of market data."""
@@ -209,6 +230,16 @@ class MarketDataRepository(Protocol):
 
     # -- candles --------------------------------------------------------
     def save_candles(self, candles: Sequence[Candle]) -> int: ...
+
+    def save_historical_candles(self, candles: Sequence[Candle]) -> CandleSaveResult:
+        """Insert new bars; never change a stored one.
+
+        A bar identical to the stored one (OHLCV and source) is a no-op. A bar
+        that differs - a re-adjusted price, or a live-built bar already in the
+        slot - is refused and returned as a conflict, and the stored row keeps
+        its values and its source.
+        """
+        ...
 
     def latest_completed_candle(
         self, instrument_token: int, interval: CandleInterval

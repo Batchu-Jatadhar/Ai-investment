@@ -31,7 +31,7 @@ from app.domain.market.models import (
     MarketTick,
     TickMode,
 )
-from app.domain.market.ports import ConnectionEvent, DataGap
+from app.domain.market.ports import CandleSaveResult, ConnectionEvent, DataGap
 from app.domain.market.quality import DataQualityEvent
 from app.infrastructure.models import (
     CandleRecord,
@@ -53,6 +53,23 @@ def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _same_bar(stored: Candle, incoming: Candle) -> bool:
+    """Whether two bars for one slot carry the same facts.
+
+    Prices compare as numbers, so ``1400.10`` read back as ``1400.100000`` is
+    still the same price. Source is part of the facts: a live-built bar and a
+    historical bar with equal prices are still two different observations.
+    """
+    return (
+        stored.open == incoming.open
+        and stored.high == incoming.high
+        and stored.low == incoming.low
+        and stored.close == incoming.close
+        and stored.volume == incoming.volume
+        and stored.source == incoming.source
+    )
 
 
 def _depth_to_json(depth: MarketDepth | None) -> dict[str, Any] | None:
@@ -360,6 +377,85 @@ class SqlMarketDataRepository:
                 )
                 written += 1
         return written
+
+    def save_historical_candles(self, candles: Sequence[Candle]) -> CandleSaveResult:
+        """Insert new bars and refuse to change stored ones. See the port.
+
+        Unlike :meth:`save_candles`, which lets the live engine revise a bar it
+        built, this never updates a row. Historical data is a snapshot: a later
+        fetch returning different prices for the same bar (a corporate-action
+        re-adjustment, a vendor correction) must surface as a conflict rather
+        than silently rewrite the history a stored backtest was run on.
+
+        One transaction for the whole batch. Existing rows are read once per
+        instrument and interval over the batch's time span rather than one
+        query per bar.
+        """
+        not_completed = [c for c in candles if not c.is_completed]
+        if not_completed:
+            raise ValueError(
+                f"{len(not_completed)} candle(s) are not COMPLETED, starting at "
+                f"{not_completed[0].start_at.isoformat()}; historical bars must be settled"
+            )
+
+        inserted = identical = 0
+        conflicts: list[Candle] = []
+        groups: dict[tuple[int, CandleInterval], list[Candle]] = {}
+        for candle in candles:
+            groups.setdefault((candle.instrument_token, candle.interval), []).append(candle)
+
+        with self._write() as session:
+            for (token, interval), batch in groups.items():
+                rows = session.execute(
+                    select(CandleRecord).where(
+                        CandleRecord.instrument_token == token,
+                        CandleRecord.interval == interval.value,
+                        CandleRecord.start_at >= min(c.start_at for c in batch),
+                        CandleRecord.start_at <= max(c.start_at for c in batch),
+                    )
+                ).scalars()
+                stored = {_aware(row.start_at): self._to_candle(row) for row in rows}
+
+                for candle in batch:
+                    existing = stored.get(candle.start_at)
+                    if existing is None:
+                        session.add(self._candle_record(candle))
+                        stored[candle.start_at] = candle
+                        inserted += 1
+                    elif _same_bar(existing, candle):
+                        identical += 1
+                    else:
+                        conflicts.append(candle)
+
+        if conflicts:
+            logger.warning(
+                "historical_candle_conflicts",
+                extra={
+                    "conflicts": len(conflicts),
+                    "first_start_at": conflicts[0].start_at.isoformat(),
+                },
+            )
+        return CandleSaveResult(inserted=inserted, identical=identical, conflicts=tuple(conflicts))
+
+    @staticmethod
+    def _candle_record(candle: Candle) -> CandleRecord:
+        return CandleRecord(
+            instrument_token=candle.instrument_token,
+            tradingsymbol=candle.tradingsymbol,
+            exchange=candle.exchange,
+            interval=candle.interval.value,
+            start_at=candle.start_at,
+            end_at=candle.end_at,
+            open=candle.open,
+            high=candle.high,
+            low=candle.low,
+            close=candle.close,
+            volume=candle.volume,
+            tick_count=candle.tick_count,
+            status=candle.status.value,
+            source=candle.source,
+            last_update_at=candle.last_update_at,
+        )
 
     def latest_completed_candle(
         self, instrument_token: int, interval: CandleInterval
