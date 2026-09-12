@@ -24,7 +24,7 @@ from app.domain.backtest.config import (
     SlippageConfig,
 )
 from app.domain.backtest.costs import LegCharges, leg_charges
-from app.domain.backtest.engine import ENGINE_VERSION, PriorAtrSource, run_backtest
+from app.domain.backtest.engine import ENGINE_VERSION, run_backtest
 from app.domain.backtest.execution import (
     EntryOutcome,
     ExecutionIntent,
@@ -87,7 +87,6 @@ __all__ = [
     "PositionBook",
     "PositionSizeError",
     "PositionTransitionError",
-    "PriorAtrSource",
     "RiskMetrics",
     "RunManifest",
     "SignalRecord",

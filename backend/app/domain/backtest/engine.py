@@ -34,7 +34,7 @@ is reported as zero.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from itertools import groupby
@@ -54,17 +54,10 @@ from app.domain.market.models import Candle
 from app.domain.strategy.contract import Signal, Strategy, StrategyContext
 from app.domain.strategy.orb import OrbStrategy
 
-__all__ = ["ENGINE_VERSION", "PriorAtrSource", "run_backtest"]
+__all__ = ["ENGINE_VERSION", "run_backtest"]
 
 #: Recorded in every manifest. Bump when the sequencing changes.
 ENGINE_VERSION = "2.6.1"
-
-#: Maps the signal bars of every session strictly before the current one to the
-#: ATR the strategy is given, or ``None`` when there is not enough history.
-#: ponytail: injected because no ATR convention for ``prior_atr`` (daily bars
-#: vs signal bars, lookback) has been approved yet; it is also not part of the
-#: input fingerprint. Fix the rule and fingerprint it before real-data runs.
-PriorAtrSource = Callable[[tuple[Candle, ...]], Decimal | None]
 
 
 def _by_session(candles: Sequence[Candle]) -> dict[date, tuple[Candle, ...]]:
@@ -78,7 +71,6 @@ def run_backtest(
     *,
     starting_capital: Decimal,
     generated_at: datetime,
-    prior_atr: PriorAtrSource,
     strategy: Strategy | None = None,
 ) -> BacktestResult:
     """Run ``backtest_input`` session by session, bar by bar, and measure it."""
@@ -99,7 +91,6 @@ def run_backtest(
         fixed_notional=data.strategy_params.fixed_notional_inr,
     )
     signal_log: list[SignalRecord] = []
-    history: tuple[Candle, ...] = ()
 
     for day, bars in sessions_5m.items():
         bounds = data.calendar.session_bounds(bars[0].start_at)
@@ -110,7 +101,7 @@ def run_backtest(
             calendar=data.calendar,
             session_open=bounds[0],
             session_close=bounds[1],
-            prior_atr=prior_atr(history),
+            prior_atr=data.prior_atr(day),
         )
         minutes = sessions_1m.get(day, ())
 
@@ -181,7 +172,6 @@ def run_backtest(
                 f"a position opened on {day} was still held when its bars ran out; the session "
                 "has no bar at the hard exit, so the trade cannot be closed honestly"
             )
-        history += bars
 
     manifest = RunManifest(
         input_fingerprint=data.fingerprint(),

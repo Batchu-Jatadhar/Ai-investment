@@ -23,10 +23,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal
 
 from app.core.canonical import canonical_datetime, canonical_decimal
 from app.core.time import to_ist
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
+from app.domain.indicators import DEFAULT_ATR_PERIOD, average_true_range
 from app.domain.market.models import Candle, CandleInterval, CandleStatus, Instrument
 from app.domain.market.session import MarketSessionCalendar
 from app.domain.strategy.params import OrbParams
@@ -35,7 +37,15 @@ __all__ = ["BacktestInput", "InvalidBacktestInputError"]
 
 #: Bumped only when the canonical rendering changes shape. A fingerprint is
 #: meaningless without knowing which rendering produced it.
-FINGERPRINT_SCHEMA = "aitrade.backtest.input.v1"
+FINGERPRINT_SCHEMA = "aitrade.backtest.input.v2"
+
+#: How the ORB context's ``prior_atr`` is derived from this input. Part of the
+#: fingerprint, so changing the rule changes the identity of every run.
+PRIOR_ATR_RULE = {
+    "method": "wilder",
+    "period": str(DEFAULT_ATR_PERIOD),
+    "source": "completed signal bars strictly before the session",
+}
 
 
 class InvalidBacktestInputError(ValueError):
@@ -241,6 +251,7 @@ class BacktestInput:
             "cost_schedule": self.cost_schedule.canonical(),
             "execution_config": self.execution_config.canonical(),
             "instrument": _instrument_payload(self.instrument),
+            "prior_atr": PRIOR_ATR_RULE,
             "schema": FINGERPRINT_SCHEMA,
             "slippage_config": self.slippage_config.canonical(),
             "strategy_params": self.strategy_params.canonical(),
@@ -275,3 +286,24 @@ class BacktestInput:
         handed one session's prefix at a time.
         """
         return tuple(sorted({to_ist(candle.start_at).date() for candle in self.candles_5m}))
+
+    def prior_atr(self, session: date) -> Decimal | None:
+        """The ATR the strategy is given for ``session``, derived from this input alone.
+
+        Wilder ATR(14) over every completed signal bar whose IST date is strictly
+        before ``session``. The session's own bars - its opening range included -
+        and anything after it never contribute, so the value is knowable at the
+        opening bell. The bars are part of the fingerprint and the rule is named
+        in it, so the same fingerprint always yields the same ATR.
+
+        ``None`` when fewer than ``period + 1`` prior bars exist - the first
+        session of a run, typically. The strategy then declines with
+        ``ATR_UNAVAILABLE``; no value is substituted.
+
+        ponytail: rescans all prior bars per session, O(sessions x bars). Carry the
+        Wilder state forward session to session if long runs make it slow.
+        """
+        prior = tuple(c for c in self.candles_5m if to_ist(c.start_at).date() < session)
+        if len(prior) < DEFAULT_ATR_PERIOD + 1:
+            return None
+        return average_true_range(prior, DEFAULT_ATR_PERIOD)

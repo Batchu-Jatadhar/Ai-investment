@@ -19,7 +19,9 @@ code.
     09:55    1018.00  1019.00  1015.00  1016.00  flat; long already signalled
 
     opening range   high 1002.00, low 990.00, width 12.00
-                    >= 4 ticks (0.20); <= 1.5 x prior ATR 20 (30.00)
+                    >= 4 ticks (0.20); <= 1.5 x prior ATR 10.00 (15.00)
+    prior ATR       Wilder ATR(14) over the 15 bars of the day before, whose
+                    14 true ranges are all exactly 10.00          = 10.00
     signal          LONG on the 09:35 bar, stop 990.00 (range low), target 2R
     entry           09:40 open 999.95 + 1 tick slippage = 1000.00 (BUY)
     quantity        floor(100000 / 1000.00)                       = 100
@@ -51,12 +53,21 @@ code.
     ending cash     500,000.00 + 1,911.75                         = 501,911.75
     total return    1911.75 / 500000                              = 0.0038235
     holding         09:40 -> 09:55                                = 15 min
-    exposure        15 min held / 40 min curve span (09:15-09:55) = 0.375
+    exposure        900 s held / 88,800 s curve span (08-20 09:15 to 08-21 09:55)
+                    = 3/296, to 28 significant digits
+                                              = 0.01013513513513513513513513514
 
 .. rubric:: The no-trade session - Thursday 2026-08-20 (IST)
 
-Opening range 1000.00-1010.00. The 09:30 bar wicks to 1012 and the 09:35 bar
-to 999, but every close stays inside the range, so nothing signals.
+It runs first and is the trade session's ATR history. Opening range
+1000.00-1010.00 from three A bars. Then B and C alternate; B wicks to 1012 and
+C to 998, but every close stays inside the range, so nothing signals - and with
+no earlier session it has no ATR anyway.
+
+    A  1005.00  1010.00  1000.00  1005.00
+    B  1005.00  1012.00  1002.00  1004.00   after close 1005 or 1006: TR 10.00
+    C  1004.00  1008.00   998.00  1006.00   after close 1004:         TR 10.00
+    A after A: TR 10.00. Every one of the 14 true ranges is 10.00, so ATR = 10.00.
 """
 
 from __future__ import annotations
@@ -132,12 +143,21 @@ NO_TRADE_5M = bars(
     NO_TRADE_OPEN,
     CandleInterval.M5,
     [
-        ("09:15", "1005.00", "1010.00", "1001.00", "1006.00"),
-        ("09:20", "1006.00", "1008.00", "1000.00", "1003.00"),
-        ("09:25", "1003.00", "1007.00", "1002.00", "1004.00"),
-        ("09:30", "1004.00", "1012.00", "1001.00", "1009.00"),
-        ("09:35", "1009.00", "1009.50", "999.00", "1001.00"),
-        ("09:40", "1001.00", "1005.00", "1000.50", "1002.00"),
+        ("09:15", "1005.00", "1010.00", "1000.00", "1005.00"),
+        ("09:20", "1005.00", "1010.00", "1000.00", "1005.00"),
+        ("09:25", "1005.00", "1010.00", "1000.00", "1005.00"),
+        ("09:30", "1005.00", "1012.00", "1002.00", "1004.00"),
+        ("09:35", "1004.00", "1008.00", "998.00", "1006.00"),
+        ("09:40", "1005.00", "1012.00", "1002.00", "1004.00"),
+        ("09:45", "1004.00", "1008.00", "998.00", "1006.00"),
+        ("09:50", "1005.00", "1012.00", "1002.00", "1004.00"),
+        ("09:55", "1004.00", "1008.00", "998.00", "1006.00"),
+        ("10:00", "1005.00", "1012.00", "1002.00", "1004.00"),
+        ("10:05", "1004.00", "1008.00", "998.00", "1006.00"),
+        ("10:10", "1005.00", "1012.00", "1002.00", "1004.00"),
+        ("10:15", "1004.00", "1008.00", "998.00", "1006.00"),
+        ("10:20", "1005.00", "1012.00", "1002.00", "1004.00"),
+        ("10:25", "1004.00", "1008.00", "998.00", "1006.00"),
     ],
 )
 #: The minutes inside the 09:15 bar.
@@ -148,8 +168,8 @@ NO_TRADE_1M = bars(
         ("09:15", "1005.00", "1007.00", "1004.00", "1006.00"),
         ("09:16", "1006.00", "1010.00", "1005.00", "1009.00"),
         ("09:17", "1009.00", "1009.00", "1003.00", "1004.00"),
-        ("09:18", "1004.00", "1005.00", "1001.00", "1002.00"),
-        ("09:19", "1002.00", "1006.00", "1002.00", "1006.00"),
+        ("09:18", "1004.00", "1005.00", "1000.00", "1002.00"),
+        ("09:19", "1002.00", "1006.00", "1002.00", "1005.00"),
     ],
 )
 
@@ -169,10 +189,6 @@ NET = Decimal("1911.75")
 ENDING_EQUITY = Decimal("501911.75")
 
 
-def fixed_atr(history: tuple[Candle, ...]) -> Decimal:
-    return Decimal("20")
-
-
 def synthetic_input(
     candles_5m: tuple[Candle, ...], candles_1m: tuple[Candle, ...]
 ) -> BacktestInput:
@@ -185,15 +201,14 @@ def run(backtest_input: BacktestInput, **overrides: object) -> BacktestResult:
     kwargs: dict[str, object] = {
         "starting_capital": CAPITAL,
         "generated_at": GENERATED_AT,
-        "prior_atr": fixed_atr,
     }
     kwargs.update(overrides)
     return run_backtest(backtest_input, **kwargs)  # type: ignore[arg-type]
 
 
-TRADE_INPUT = synthetic_input(TRADE_5M, TRADE_1M)
+#: The trade session needs the no-trade day before it as ATR history.
+TRADE_INPUT = synthetic_input(NO_TRADE_5M + TRADE_5M, NO_TRADE_1M + TRADE_1M)
 NO_TRADE_INPUT = synthetic_input(NO_TRADE_5M, NO_TRADE_1M)
-BOTH_INPUT = synthetic_input(NO_TRADE_5M + TRADE_5M, NO_TRADE_1M + TRADE_1M)
 
 
 def assert_the_known_trade(result: BacktestResult) -> None:
@@ -237,7 +252,7 @@ class TestKnownProfitableTrade:
     def test_ending_cash_and_equity(self) -> None:
         result = run(TRADE_INPUT)
         assert [(p.at, p.cash, p.equity) for p in result.equity_curve] == [
-            (TRADE_OPEN, CAPITAL, CAPITAL),
+            (NO_TRADE_OPEN, CAPITAL, CAPITAL),
             (EXIT_AT, ENDING_EQUITY, ENDING_EQUITY),
         ]
 
@@ -260,7 +275,7 @@ class TestKnownProfitableTrade:
         assert portfolio.total_return == Decimal("0.0038235")
         assert portfolio.max_drawdown == Decimal("0")
         assert portfolio.time_in_market == timedelta(minutes=15)
-        assert portfolio.exposure == Decimal("0.375")
+        assert portfolio.exposure == Decimal("0.01013513513513513513513513514")
         assert portfolio.active_days == 1
         assert result.performance.risk.mean_return == Decimal("0.0038235")
         assert result.performance.risk.sharpe_per_trade is None  # one observation
@@ -277,6 +292,13 @@ class TestKnownProfitableTrade:
 
 
 class TestNoTradeSession:
+    def test_a_breakout_without_prior_history_is_declined_not_traded(self) -> None:
+        """The trade session alone has no earlier bars, so no ATR: the 09:35
+        breakout is rejected as ATR_UNAVAILABLE rather than traded."""
+        result = run(synthetic_input(TRADE_5M, TRADE_1M))
+        assert result.signal_log == ()
+        assert result.trades == ()
+
     def test_nothing_signals_and_nothing_trades(self) -> None:
         result = run(NO_TRADE_INPUT)
         assert result.signal_log == ()
@@ -291,7 +313,7 @@ class TestNoTradeSession:
 class TestSignalLogIsSeparateFromTrades:
     def test_a_signal_on_the_last_bar_is_logged_but_never_traded(self) -> None:
         """Cut the session at the 09:35 signal bar: there is no bar to enter on."""
-        result = run(synthetic_input(TRADE_5M[:5], TRADE_1M))
+        result = run(synthetic_input(NO_TRADE_5M + TRADE_5M[:5], NO_TRADE_1M + TRADE_1M))
         assert [r.signal.signal_bar_start for r in result.signal_log] == [SIGNAL_BAR]
         assert result.trades == ()
         assert result.equity_curve[-1].equity == CAPITAL
@@ -307,9 +329,11 @@ class RecordingStrategy:
         self.inner = OrbStrategy()
         self.events = events
         self.prefixes: list[tuple[Candle, ...]] = []
+        self.atrs: list[Decimal | None] = []
 
     def on_bar(self, session_bars, context: StrategyContext):  # noqa: ANN001, ANN201
         self.prefixes.append(tuple(session_bars))
+        self.atrs.append(context.prior_atr)
         self.events.append((session_bars[-1].start_at, 2))
         return self.inner.on_bar(session_bars, context)
 
@@ -344,7 +368,7 @@ class TestSequencing:
         self, events: list[tuple[datetime, int]]
     ) -> None:
         strategy = RecordingStrategy(events)
-        assert_the_known_trade(run(BOTH_INPUT, strategy=strategy))
+        assert_the_known_trade(run(TRADE_INPUT, strategy=strategy))
 
         assert [at for at, step in events if step == 2] == [
             bar.start_at for bar in NO_TRADE_5M + TRADE_5M
@@ -357,21 +381,18 @@ class TestSequencing:
         self, events: list[tuple[datetime, int]]
     ) -> None:
         strategy = RecordingStrategy(events)
-        run(BOTH_INPUT, strategy=strategy)
+        run(TRADE_INPUT, strategy=strategy)
         expected = [NO_TRADE_5M[: i + 1] for i in range(len(NO_TRADE_5M))] + [
             TRADE_5M[: i + 1] for i in range(len(TRADE_5M))
         ]
         assert strategy.prefixes == expected
 
-    def test_prior_atr_sees_only_earlier_sessions(self) -> None:
-        seen: list[tuple[Candle, ...]] = []
-
-        def recording_atr(history: tuple[Candle, ...]) -> Decimal:
-            seen.append(history)
-            return Decimal("20")
-
-        run(BOTH_INPUT, prior_atr=recording_atr)
-        assert seen == [(), NO_TRADE_5M]
+    def test_strategy_is_given_the_input_derived_prior_atr(
+        self, events: list[tuple[datetime, int]]
+    ) -> None:
+        strategy = RecordingStrategy(events)
+        run(TRADE_INPUT, strategy=strategy)
+        assert strategy.atrs == [None] * len(NO_TRADE_5M) + [Decimal("10")] * len(TRADE_5M)
 
 
 class TestDeterminism:
@@ -385,7 +406,7 @@ class TestDeterminism:
 
 class TestMultiSessionAggregation:
     def test_a_no_trade_day_then_a_trade_day(self) -> None:
-        result = run(BOTH_INPUT)
+        result = run(TRADE_INPUT)
         assert [r.signal.signal_bar_start for r in result.signal_log] == [SIGNAL_BAR]
         assert_the_known_trade(result)
         assert [(p.at, p.equity) for p in result.equity_curve] == [
@@ -398,4 +419,4 @@ class TestMultiSessionAggregation:
         assert portfolio.ending_equity == ENDING_EQUITY
         assert portfolio.total_return == Decimal("0.0038235")
         assert portfolio.active_days == 1
-        assert result.manifest.input_fingerprint == BOTH_INPUT.fingerprint()
+        assert result.manifest.input_fingerprint == TRADE_INPUT.fingerprint()
