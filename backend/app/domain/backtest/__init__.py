@@ -7,8 +7,8 @@ that record a run's assumptions, and the result models.
 Nothing in this package simulates anything yet. Phase 2.3 adds
 :class:`~app.domain.backtest.execution.ExecutionIntent`, the seam that states
 what the simulator has been asked to do; the simulator that acts on it arrives
-in Phase 2.4, along with portfolio accounting, then metrics in Phase 2.5 and the
-engine that sequences them in Phase 2.6.
+in Phase 2.4, along with portfolio accounting, then metrics in Phase 2.5, and
+:func:`~app.domain.backtest.engine.run_backtest` sequences them in Phase 2.6.
 
 It lives under ``app/domain`` because it is pure: it imports no adapter, no
 broker, no ORM and no clock, and the architecture-purity tests enforce that.
@@ -24,6 +24,7 @@ from app.domain.backtest.config import (
     SlippageConfig,
 )
 from app.domain.backtest.costs import LegCharges, leg_charges
+from app.domain.backtest.engine import ENGINE_VERSION, PriorAtrSource, run_backtest
 from app.domain.backtest.execution import (
     EntryOutcome,
     ExecutionIntent,
@@ -61,6 +62,7 @@ from app.domain.backtest.result import BacktestResult
 from app.domain.backtest.sizing import PositionSizeError, fixed_notional_quantity
 
 __all__ = [
+    "ENGINE_VERSION",
     "NSE_INTRADAY_EQUITY",
     "AmbiguityResolution",
     "BacktestInput",
@@ -85,6 +87,7 @@ __all__ = [
     "PositionBook",
     "PositionSizeError",
     "PositionTransitionError",
+    "PriorAtrSource",
     "RiskMetrics",
     "RunManifest",
     "SignalRecord",
@@ -102,4 +105,5 @@ __all__ = [
     "resolve_hard_exit_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
+    "run_backtest",
 ]
