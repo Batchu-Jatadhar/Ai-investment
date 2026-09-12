@@ -37,6 +37,7 @@ __all__ = [
     "ConnectionEvent",
     "ConnectionEventType",
     "DataGap",
+    "HistoricalCandleSource",
     "InstrumentSource",
     "MarketDataProvider",
     "MarketDataRepository",
@@ -202,6 +203,25 @@ class InstrumentSource(Protocol):
     name: str
 
     async def fetch_instruments(self, exchange: str | None = None) -> list[Instrument]: ...
+
+
+@runtime_checkable
+class HistoricalCandleSource(Protocol):
+    """Somewhere completed historical candles can be fetched from, one window at a time."""
+
+    name: str
+
+    async def fetch_historical_candles(
+        self,
+        instrument: Instrument,
+        interval: CandleInterval,
+        *,
+        start: datetime,
+        end: datetime,
+        as_of: datetime,
+    ) -> list[Candle]:
+        """Completed bars in ``[start, end)`` that had finished by ``as_of``."""
+        ...
 
 
 @runtime_checkable
