@@ -139,8 +139,14 @@ class Settings(BaseSettings):
     compliance_registered_ip: str | None = None
     compliance_confirmation_ref: str | None = None
 
-    # -- Not implemented in this phase -------------------------------------
+    # -- TradingView alert webhook (inbound, advisory, paper mode only) -----
+    # Unset secret -> the endpoint answers 503 and accepts nothing.
     tradingview_webhook_secret: SecretStr | None = Field(default=None)
+    tradingview_webhook_max_age_seconds: int = 60
+    tradingview_webhook_max_future_seconds: int = 30
+    tradingview_webhook_max_body_bytes: int = 4096
+
+    # -- Not implemented in this phase -------------------------------------
     anthropic_api_key: SecretStr | None = Field(default=None)
 
     # ------------------------------------------------------------------ #
@@ -283,6 +289,17 @@ class Settings(BaseSettings):
             )
         if self.instrument_master_max_age_hours <= 0:
             raise ConfigurationError("INSTRUMENT_MASTER_MAX_AGE_HOURS must be positive")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_webhook(self) -> Settings:
+        for name in (
+            "tradingview_webhook_max_age_seconds",
+            "tradingview_webhook_max_future_seconds",
+            "tradingview_webhook_max_body_bytes",
+        ):
+            if getattr(self, name) <= 0:
+                raise ConfigurationError(f"{name.upper()} must be positive")
         return self
 
 

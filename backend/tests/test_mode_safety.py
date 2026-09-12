@@ -21,6 +21,11 @@ from app.config.settings import (
 )
 from tests.conftest import build_settings
 
+#: The one write endpoint: the inbound alert webhook, authorised by the
+#: architecture's web process as the webhook gateway. It records advisory alerts
+#: and executes nothing.
+WEBHOOK_PATH = "/webhooks/tradingview"
+
 FULL_LIVE_CONFIG = {
     "trading_mode": "live",
     "zerodha_api_key": "k",
@@ -113,8 +118,6 @@ class TestNoExecutionSurface:
         "position",
         "broker",
         "zerodha",
-        "webhook",
-        "tradingview",
         "kill",
         "flatten",
     )
@@ -130,8 +133,8 @@ class TestNoExecutionSurface:
         offending = sorted(p for p in paths if any(w in p.lower() for w in self.FORBIDDEN))
         assert offending == [], f"execution-capable routes must not exist: {offending}"
 
-    def test_no_mutating_methods_are_exposed(self, app: FastAPI) -> None:
-        """Phase 0 is read-only. Nothing may accept a write."""
+    def test_the_alert_webhook_is_the_only_write_endpoint(self, app: FastAPI) -> None:
+        """Everything else is read-only. No PUT, PATCH or DELETE anywhere."""
         schema = app.openapi()["paths"]
         mutating = sorted(
             f"{method.upper()} {path}"
@@ -139,11 +142,12 @@ class TestNoExecutionSurface:
             for method in ops
             if method.lower() in {"post", "put", "patch", "delete"}
         )
-        assert mutating == [], f"no write endpoints are permitted yet: {mutating}"
+        assert mutating == [f"POST {WEBHOOK_PATH}"], f"unexpected write endpoints: {mutating}"
 
-    def test_only_read_only_surfaces_are_exposed(self, app: FastAPI) -> None:
-        """Health plus read-only market-data queries. Nothing else."""
+    def test_only_known_surfaces_are_exposed(self, app: FastAPI) -> None:
+        """Health, read-only market-data queries and the alert webhook. Nothing else."""
         assert self._published_paths(app) == {
+            WEBHOOK_PATH,
             "/health",
             "/health/db",
             "/health/market-data",
@@ -233,15 +237,16 @@ class TestNoOrderCapabilityInSource:
         assert offenders == [], f"order capability must not exist: {offenders}"
 
     def test_no_write_handlers_exist_in_the_http_layer(self) -> None:
-        """No POST/PUT/PATCH/DELETE handler - so no webhook and no order route."""
+        """No PUT/PATCH/DELETE handler anywhere, and exactly one POST handler: the
+        alert webhook in webhooks.py. No order route can hide behind a POST."""
         api = pathlib.Path(__file__).resolve().parents[1] / "app" / "api"
-        offenders: list[str] = []
+        handlers: list[str] = []
         for path in sorted(api.rglob("*.py")):
             text = path.read_text(encoding="utf-8")
             for verb in (".post(", ".put(", ".patch(", ".delete("):
-                if f"@router{verb}" in text or f"@api_router{verb}" in text:
-                    offenders.append(f"{path.name}: {verb}")
-        assert offenders == []
+                for prefix in ("@router", "@api_router", "@app"):
+                    handlers.extend([f"{path.name}: {verb}"] * text.count(f"{prefix}{verb}"))
+        assert handlers == ["webhooks.py: .post("]
 
     def test_no_llm_client_is_wired_in(self) -> None:
         offenders: list[str] = []
@@ -416,3 +421,71 @@ class TestDomainPurity:
                 ):
                     offenders.append(f"{path.name}:{node.lineno} float() call")
         assert offenders == [], f"the money path must not use float: {offenders}"
+
+
+class TestAlertWebhookBoundary:
+    """The TradingView webhook stays an inbound, advisory, vendor-contained edge.
+
+    TradingView is allowed to *announce* something. It is not allowed to size,
+    price or place a trade, to become a market-data source, or to leak its
+    vocabulary into the domain.
+    """
+
+    APP = pathlib.Path(__file__).resolve().parents[1] / "app"
+    WEBHOOK_MODULES = (
+        "adapters/tradingview/__init__.py",
+        "adapters/tradingview/webhook.py",
+        "api/webhooks.py",
+        "infrastructure/repositories/alerts.py",
+        "domain/alerts.py",
+    )
+
+    def test_the_domain_never_knows_about_tradingview(self) -> None:
+        offenders = [
+            str(path.relative_to(self.APP))
+            for path in sorted((self.APP / "domain").rglob("*.py"))
+            if "tradingview" in path.read_text(encoding="utf-8").lower()
+        ]
+        assert offenders == [], f"the domain must stay vendor-neutral: {offenders}"
+
+    def test_webhook_modules_reach_no_trading_broker_or_market_data_code(self) -> None:
+        forbidden = (
+            "app.adapters.zerodha",
+            "app.adapters.replay",
+            "app.domain.backtest",
+            "app.domain.strategy",
+            "app.domain.execution",
+            "app.domain.orders",
+            "app.domain.broker",
+            "app.domain.portfolio",
+            "app.domain.positions",
+            "app.domain.risk",
+            "app.domain.ai",
+            "app.domain.market",
+            "app.services",
+            "app.runtime",
+            "kiteconnect",
+        )
+        offenders = [
+            f"{module}: {needle}"
+            for module in self.WEBHOOK_MODULES
+            for needle in forbidden
+            if needle in (self.APP / module).read_text(encoding="utf-8")
+        ]
+        assert offenders == [], f"the webhook must stay an advisory edge: {offenders}"
+
+    def test_no_alert_type_can_carry_trade_parameters(self) -> None:
+        """Neither the inbound contract nor the domain event has anywhere to put a
+        quantity, price, stop, target or order detail."""
+        import dataclasses
+
+        from app.adapters.tradingview.webhook import TradingViewAlertPayload
+        from app.domain.alerts import ExternalAlert
+
+        tradeish = ("qty", "quantity", "size", "price", "stop", "target", "order", "lot", "product")
+        fields = {f.name for f in dataclasses.fields(ExternalAlert)} | set(
+            TradingViewAlertPayload.model_fields
+        )
+        offending = sorted(f for f in fields if any(word in f.lower() for word in tradeish))
+        assert offending == [], f"alerts must not carry trade parameters: {offending}"
+        assert TradingViewAlertPayload.model_config.get("extra") == "forbid"

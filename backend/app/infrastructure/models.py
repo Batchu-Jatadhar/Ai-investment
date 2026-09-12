@@ -250,3 +250,33 @@ class DataQualityEventRecord(Base):
     instrument_token: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+# --------------------------------------------------------------------------- #
+# Inbound alert webhooks
+# --------------------------------------------------------------------------- #
+
+
+class WebhookEventRecord(Base):
+    """An accepted external alert, kept so the same event is never accepted twice.
+
+    The unique ``(source, event_id)`` constraint is the idempotency guarantee:
+    the database, not process memory, decides whether an event is new, so it
+    holds across restarts and across more than one API worker.
+    """
+
+    __tablename__ = "webhook_event"
+    __table_args__ = (
+        UniqueConstraint("source", "event_id", name="uq_webhook_event_source_event"),
+        Index("ix_webhook_event_received_at", "received_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(16), nullable=False)
+    tradingsymbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    note: Mapped[str] = mapped_column(String(280), nullable=False, default="")
