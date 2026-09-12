@@ -32,6 +32,20 @@ It reaches the stop and trades through the target, so its 1-minute bars decide.
     costs          30.34 + 51.90                                =     82.24
     net            -1505.00 - 82.24                             = -1,587.24
     ending equity  500,000.00 - 1,587.24                        = 498,412.76
+
+.. rubric:: Hard exit - held all day, flattened on the 15:10-15:15 bar
+
+Quiet bars (1004.00-1006.00) never reach the stop or the target. The 15:10 bar
+closes at 1010.00; its close is 15:15, the cutoff.
+
+    fill           the close, 1010.00, less 1 tick             =  1,009.95
+    gross          (1009.95 - 1000.00) x 100                    =    995.00
+    exit costs     turnover 100,995.00: brokerage 20.00 (capped),
+                   STT 25.24875 -> 25.25, exchange 3.1005465 -> 3.10,
+                   SEBI 0.10, GST 18% x 23.20 = 4.176 -> 4.18   =     52.63
+    costs          30.34 + 52.63                                =     82.97
+    net            995.00 - 82.97                               =    912.03
+    ending equity  500,000.00 + 912.03                          = 500,912.03
 """
 
 from __future__ import annotations
@@ -380,3 +394,39 @@ class TestNextBarEntry:
         assert json.dumps(asdict(first), default=str, sort_keys=True) == json.dumps(
             asdict(second), default=str, sort_keys=True
         )
+
+
+#: 09:45 to 15:05, every bar inside 1004.00-1006.00.
+QUIET_5M = tuple(
+    make_candle(
+        ist(TRADE_OPEN, "09:45") + M5.delta * i,
+        M5,
+        open_="1005.00",
+        high="1006.00",
+        low="1004.00",
+        close="1005.00",
+    )
+    for i in range(65)
+)
+CUTOFF_5M = bars(TRADE_OPEN, M5, [("15:10", "1005.00", "1011.00", "1004.00", "1010.00")])
+#: After the cutoff, and wide enough to hit the target or the stop if it were read.
+AFTER_CUTOFF_5M = bars(TRADE_OPEN, M5, [("15:15", "1010.00", "1030.00", "980.00", "1000.00")])
+
+
+def test_the_engine_flattens_an_open_position_at_the_hard_exit() -> None:
+    assert QUIET_5M[-1].start_at == ist(TRADE_OPEN, "15:05")
+    result = trade_day(ENTRY_5M + QUIET_5M + CUTOFF_5M + AFTER_CUTOFF_5M, ())
+
+    (trade,) = result.trades
+    assert trade.exit_reason is FillReason.TIME_EXIT
+    assert trade.exit.bar_start == ist(TRADE_OPEN, "15:10")
+    assert trade.exit.occurred_at == ist(TRADE_OPEN, "15:15")
+    assert trade.exit.reference_price == Decimal("1010.00")
+    assert trade.exit.price == Decimal("1009.95")
+    assert trade.exit.costs == Decimal("52.63")
+    assert (trade.gross_pnl, trade.costs, trade.net_pnl) == (
+        Decimal("995.00"),
+        Decimal("82.97"),
+        Decimal("912.03"),
+    )
+    assert result.equity_curve[-1].equity == Decimal("500912.03")
