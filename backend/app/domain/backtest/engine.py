@@ -8,8 +8,11 @@ each of them exactly what it may see at that moment.
 
 .. rubric:: The order, per 5-minute bar
 
-1.  **Enter** a pending intent at this bar's open. The intent was formed on the
-    previous bar's close, so this bar is strictly after the signal.
+1.  **Enter** a pending signal at this bar's open - but only if this bar is the
+    exact next bucket after the signal bar. If that bucket is missing from the
+    data, the entry resolver is told there is no execution bar and reports
+    ``NO_EXECUTION_BAR``; a later bar is never substituted, because its open is
+    a price the signal could not have been acted on at.
 2.  **Exit** on this bar - the stop or the target, same-bar collisions resolved
     from this bar's own 1-minute bars - and, failing both, the hard exit.
 3.  **Decide** on this bar's close. The strategy is handed the session prefix
@@ -57,7 +60,7 @@ from app.domain.strategy.orb import OrbStrategy
 __all__ = ["ENGINE_VERSION", "run_backtest"]
 
 #: Recorded in every manifest. Bump when the sequencing changes.
-ENGINE_VERSION = "2.6.1"
+ENGINE_VERSION = "2.6.3"
 
 
 def _by_session(candles: Sequence[Candle]) -> dict[date, tuple[Candle, ...]]:
@@ -81,6 +84,7 @@ def run_backtest(
     tick_size = data.instrument.tick_size
     costs = data.cost_schedule
     slippage = data.slippage_config
+    interval = data.strategy_params.signal_interval.delta
 
     sessions_5m = _by_session(data.candles_5m)
     sessions_1m = _by_session(data.candles_1m)
@@ -110,24 +114,32 @@ def run_backtest(
 
         for index, bar in enumerate(bars):
             if pending is not None:
+                entry_bar_start = pending.signal_bar_start + interval
+                next_bar = bar if bar.start_at == entry_bar_start else None
                 # Sized from the price the entry actually fills at, which is not
-                # known until this bar opens: probe the fill for one share, size
+                # known until the bar opens: probe the fill for one share, size
                 # from its price, then fill the real quantity.
                 probe = resolve_entry_fill(
-                    ExecutionIntent(pending, 1, bar.start_at),
-                    bar,
+                    ExecutionIntent(pending, 1, entry_bar_start),
+                    next_bar,
                     tick_size=tick_size,
                     slippage=slippage,
                 )
-                assert probe.fill is not None
-                quantity = portfolio.size_for(probe.fill.price, lot_size=data.instrument.lot_size)
-                intent = ExecutionIntent(pending, quantity, bar.start_at)
-                entry = resolve_entry_fill(
-                    intent, bar, tick_size=tick_size, slippage=slippage, cost_schedule=costs
-                ).fill
-                assert entry is not None
-                portfolio = portfolio.enter(intent, entry)
-                held = (intent, entry)
+                if probe.fill is not None:
+                    quantity = portfolio.size_for(
+                        probe.fill.price, lot_size=data.instrument.lot_size
+                    )
+                    intent = ExecutionIntent(pending, quantity, entry_bar_start)
+                    entry = resolve_entry_fill(
+                        intent,
+                        next_bar,
+                        tick_size=tick_size,
+                        slippage=slippage,
+                        cost_schedule=costs,
+                    ).fill
+                    assert entry is not None
+                    portfolio = portfolio.enter(intent, entry)
+                    held = (intent, entry)
                 pending = None
 
             if held is not None:

@@ -36,7 +36,8 @@ It reaches the stop and trades through the target, so its 1-minute bars decide.
 
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -332,3 +333,50 @@ class TestMultiSession:
         ]
         assert all(r.accepted for r in result.signal_log)
         assert [t.entry.occurred_at for t in result.trades] == [self.MONDAY + timedelta(minutes=25)]
+
+
+#: 09:40 is missing. These later bars would have made a winning long had the
+#: engine entered on the first bar it happened to have.
+AFTER_A_MISSING_BUCKET_5M = bars(
+    TRADE_OPEN,
+    M5,
+    [
+        ("09:45", "999.95", "1008.00", "998.00", "1006.00"),
+        ("09:50", "1006.00", "1021.00", "1004.00", "1018.00"),
+    ],
+)
+
+
+class TestNextBarEntry:
+    def test_entry_is_the_bucket_immediately_after_the_signal_bar(self) -> None:
+        result = trade_day(ENTRY_5M + COLLISION_5M, STOP_FIRST_1M)
+        (record,) = result.signal_log
+        assert result.trades[0].entry.bar_start == record.signal.signal_bar_start + M5.delta
+
+    def test_a_missing_next_bucket_means_no_entry(self) -> None:
+        result = trade_day(AFTER_A_MISSING_BUCKET_5M[:1], ())
+        assert [r.signal.signal_bar_start for r in result.signal_log] == [ist(TRADE_OPEN, "09:35")]
+        assert result.trades == ()
+        assert result.equity_curve[-1].equity == Decimal("500000")
+
+    def test_a_later_bar_is_never_used_in_its_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        offered: list[Candle | None] = []
+        original = engine.resolve_entry_fill
+
+        def spy(intent, next_bar, **kwargs):  # noqa: ANN001, ANN202
+            offered.append(next_bar)
+            return original(intent, next_bar, **kwargs)
+
+        monkeypatch.setattr(engine, "resolve_entry_fill", spy)
+        result = trade_day(AFTER_A_MISSING_BUCKET_5M, ())
+
+        assert offered == [None]  # asked once, with no bar - not with 09:45
+        assert result.trades == ()
+        assert len(result.signal_log) == 1
+
+    def test_the_outcome_is_deterministic(self) -> None:
+        first = trade_day(AFTER_A_MISSING_BUCKET_5M, ())
+        second = trade_day(AFTER_A_MISSING_BUCKET_5M, ())
+        assert json.dumps(asdict(first), default=str, sort_keys=True) == json.dumps(
+            asdict(second), default=str, sort_keys=True
+        )
