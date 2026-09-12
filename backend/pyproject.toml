@@ -32,6 +32,7 @@ dev = [
 
 [project.scripts]
 aitrade-marketdata = "app.runtime.market_data:main"
+aitrade-backfill = "app.runtime.historical_backfill:main"
 
 [build-system]
 requires = ["setuptools>=68"]
