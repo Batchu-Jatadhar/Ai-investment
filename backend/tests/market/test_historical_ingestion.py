@@ -319,3 +319,67 @@ async def test_a_range_off_the_fifteen_minute_grid_is_rejected_before_any_fetch(
             RELIANCE, start=FRI + timedelta(minutes=5), end=SAT, as_of=AS_OF
         )
     assert script.events == []
+
+
+async def test_end_to_end_through_the_real_client_makes_only_historical_gets(repository) -> None:  # noqa: ANN001
+    """The service over the real Zerodha client and a mock transport: every
+    request is a read-only historical GET for 1m data - nothing else is ever
+    called - and the stored bars match the script-driven tests."""
+    import httpx
+
+    from app.adapters.zerodha.client import ZerodhaRestClient
+    from app.domain.market.ports import HistoricalCandleSource
+
+    friday_rows = ", ".join(
+        f'["2026-08-21T09:{15 + i}:00+0530", {100 + i}, {101 + i}, {99 + i}, {100 + i}.5, 10]'
+        for i in range(15)
+    )
+    bodies = {
+        "2026-08-20 00:00:00": '{"status": "success", "data": {"candles": []}}',
+        "2026-08-21 00:00:00": '{"status": "success", "data": {"candles": [' + friday_rows + "]}}",
+    }
+    requests: list[httpx.Request] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=bodies[request.url.params["from"]])
+
+    client = ZerodhaRestClient(
+        api_key="k",
+        access_token="t",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(transport)),
+    )
+    assert isinstance(client, HistoricalCandleSource)
+    script = Script({})  # supplies fake time only
+    ingestion = HistoricalIngestionService(
+        source=client,
+        repository=repository,
+        throttle=RequestThrottle(script.clock, script.sleep),
+        retry_policy=RetryPolicy(),
+        sleep=script.sleep,
+        max_window=DAY,
+    )
+
+    report = await ingestion.ingest(RELIANCE, start=THU, end=SAT, as_of=AS_OF)
+
+    assert [(r.method, r.url.path, dict(r.url.params)) for r in requests] == [
+        (
+            "GET",
+            "/instruments/historical/738561/minute",
+            {"from": "2026-08-20 00:00:00", "to": "2026-08-21 00:00:00"},
+        ),
+        (
+            "GET",
+            "/instruments/historical/738561/minute",
+            {"from": "2026-08-21 00:00:00", "to": "2026-08-22 00:00:00"},
+        ),
+    ]
+    assert report.completed
+    assert [w.outcome for w in report.windows] == [WindowOutcome.NO_DATA, WindowOutcome.INGESTED]
+    assert report.no_data_sessions == (date(2026, 8, 20),)
+    assert (counts(report, M1), counts(report, M5), counts(report, M15)) == (
+        (15, 0, 0),
+        (3, 0, 0),
+        (1, 0, 0),
+    )
+    assert [c.close for c in stored(repository, M15, THU, SAT)] == [Decimal("114.5")]
