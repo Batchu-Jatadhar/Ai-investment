@@ -10,6 +10,27 @@ The response is treated as untrusted input. Every row is checked before it
 becomes a candle, and a single bad row fails the whole response with
 :class:`ZerodhaProtocolError` rather than being skipped: a gap silently left in
 the middle of a price series is worse than a fetch that visibly failed.
+
+.. rubric:: Verified live behaviour (read-only smoke tests, September 2026)
+
+Two real ``minute`` requests for NSE:RELIANCE (token 738561), each asking for
+``09:15:00`` to ``15:30:00`` IST on a trading day (2026-09-10 and 2026-09-11),
+returned the same shape:
+
+*   ``data`` holds only a ``candles`` list of 6-field rows, timestamps carry
+    ``+0530``, and prices arrive as JSON decimals or, when whole, as integers;
+*   360 contiguous one-minute bars, the first starting 09:15 IST and the last
+    starting **15:14 IST, so the data ends at 15:15 IST** - no bars for
+    15:15-15:30 were returned, although the request covered them;
+*   the parser accepted every row, and the bars aggregate into 72 complete
+    5-minute bars.
+
+Treat 15:15 IST as the currently verified end of this data path. It is evidence
+from one instrument on two sessions, not a guarantee for every instrument or
+date, so nothing here depends on it: the parser neither expects 375 bars nor
+pads the missing tail, and a session that does return bars to 15:30 is parsed
+the same way. Downstream, the 15:15 hard exit still has its 15:10-15:15 bar, but
+any rule that needs a 15:15-15:30 bar from this source will not find one.
 """
 
 from __future__ import annotations

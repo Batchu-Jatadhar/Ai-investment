@@ -153,6 +153,36 @@ async def test_rows_outside_the_requested_window_are_filtered() -> None:
     assert [c.start_at for c in candles] == [OPEN_UTC, OPEN_UTC + timedelta(minutes=10)]
 
 
+async def test_the_verified_live_minute_session_shape_is_parsed_without_padding() -> None:
+    """The shape two real RELIANCE sessions returned for 09:15-15:30 IST: 360 minutes,
+    +0530 timestamps, a whole-number price sent as a JSON integer, and nothing after
+    the bar starting 15:14 IST. The parser keeps all 360, invents no 15:15-15:30 bars,
+    and the minutes still aggregate into complete 5-minute bars."""
+    from app.domain.market.aggregation import aggregate_minutes
+
+    minutes = [OPEN_UTC + timedelta(minutes=i) for i in range(360)]
+    rows = [
+        '["2026-08-21T09:15:00+0530", 1267, 1267.4, 1261.5, 1262.7, 188567]',
+        *(
+            f'["{(m + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")}+0530", '
+            "1262.7, 1263, 1262.1, 1262.5, 1000]"
+            for m in minutes[1:]
+        ),
+    ]
+    session_end = OPEN_UTC + timedelta(hours=6, minutes=15)  # 15:30 IST
+
+    candles, _ = await fetch(body(*rows), interval=CandleInterval.M1, end=session_end)
+
+    assert len(candles) == 360
+    assert [c.start_at for c in candles] == minutes
+    assert candles[-1].end_at == OPEN_UTC + timedelta(hours=6)  # 15:15 IST, not 15:30
+    first = candles[0]
+    assert (first.open, first.high) == (Decimal("1267"), Decimal("1267.4"))
+    assert isinstance(first.open, Decimal) and isinstance(candles[1].high, Decimal)
+    aggregated = aggregate_minutes(candles, CandleInterval.M5)
+    assert (len(aggregated.candles), aggregated.incomplete) == (72, ())
+
+
 @pytest.mark.parametrize(
     "text",
     [
