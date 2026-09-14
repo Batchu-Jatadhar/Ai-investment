@@ -185,7 +185,7 @@ def run_golden(
 
 
 # --- hand-calculated expectations -------------------------------------------
-ENGINE_VERSION = "2.6.3"
+ENGINE_VERSION = "2.7.0"
 FRI_SIGNAL_AT = at(FRI, "09:35")
 MON_SIGNAL_AT = at(MON, "09:35")
 STOP = Decimal("994.00")

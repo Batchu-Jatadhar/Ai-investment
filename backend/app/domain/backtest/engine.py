@@ -33,6 +33,16 @@ metric. No clock: ``generated_at`` is supplied by the caller. No randomness. All
 run state lives in local variables of :func:`run_backtest`, so two calls cannot
 share anything.
 
+.. rubric:: Sessions
+
+Before a session's bars are replayed, its opening window must be fully covered.
+A session without one - a special session that starts later in the day, or
+minutes missing from the open - cannot form an opening range, so it is recorded
+as ``UNTRADABLE_NO_OPENING_RANGE`` and skipped: the strategy is never asked, no
+signal can exist and no bar is filled in. Later sessions are replayed normally.
+Every calendar trading day of the run gets exactly one :class:`SessionRecord`,
+including ``NO_DATA`` for a trading day with no bars at all.
+
 Data that cannot establish a fill raises :class:`UnexecutableBarError` out of
 the run. Session quarantine is not implemented yet, so ``quarantined_sessions``
 is reported as zero. ``BacktestInput`` carries no recorded feed gaps either, so
@@ -44,7 +54,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from itertools import groupby
 
@@ -56,9 +66,16 @@ from app.domain.backtest.execution import (
     resolve_hard_exit_fill,
 )
 from app.domain.backtest.input import BacktestInput
-from app.domain.backtest.models import Fill, RunManifest, SignalRecord
+from app.domain.backtest.models import (
+    Fill,
+    RunManifest,
+    SessionRecord,
+    SessionStatus,
+    SignalRecord,
+)
 from app.domain.backtest.portfolio import Portfolio
 from app.domain.backtest.result import BacktestResult
+from app.domain.indicators import IndicatorError, opening_range
 from app.domain.market.models import Candle
 from app.domain.strategy.contract import Signal, Strategy, StrategyContext
 from app.domain.strategy.orb import OrbStrategy
@@ -66,7 +83,7 @@ from app.domain.strategy.orb import OrbStrategy
 __all__ = ["ENGINE_VERSION", "SignalGate", "run_backtest"]
 
 #: Recorded in every manifest. Bump when the sequencing changes.
-ENGINE_VERSION = "2.6.3"
+ENGINE_VERSION = "2.7.0"
 
 #: Decides whether a strategy signal may be traded. Handed the signal, the session
 #: prefix that produced it and the context, it returns that signal's record. It may
@@ -79,6 +96,24 @@ def _by_session(candles: Sequence[Candle]) -> dict[date, tuple[Candle, ...]]:
     return {
         day: tuple(bars) for day, bars in groupby(candles, key=lambda c: to_ist(c.start_at).date())
     }
+
+
+def _has_opening_range(bars: Sequence[Candle], day: date, data: BacktestInput) -> bool:
+    """Whether ``day``'s bars fully cover its opening window.
+
+    Asks the same :func:`opening_range` the strategy uses, so "untradable" means
+    exactly "the strategy could not have formed a range", with no second rule.
+    """
+    try:
+        opening_range(
+            bars,
+            day,
+            data.calendar,
+            opening_range_minutes=data.strategy_params.opening_range_minutes,
+        )
+    except IndicatorError:
+        return False
+    return True
 
 
 def run_backtest(
@@ -112,11 +147,16 @@ def run_backtest(
         fixed_notional=data.strategy_params.fixed_notional_inr,
     )
     signal_log: list[SignalRecord] = []
+    session_log: list[SessionRecord] = []
 
     for day, bars in sessions_5m.items():
         bounds = data.calendar.session_bounds(bars[0].start_at)
         if bounds is None:
             raise ValueError(f"{day} has signal bars but is not a trading day on the calendar")
+        if not _has_opening_range(bars, day, data):
+            session_log.append(SessionRecord(day, SessionStatus.UNTRADABLE_NO_OPENING_RANGE))
+            continue
+        signals_before, trades_before = len(signal_log), len(portfolio.trades)
         context = StrategyContext(
             instrument=data.instrument,
             calendar=data.calendar,
@@ -223,6 +263,26 @@ def run_backtest(
                 "has no bar at the hard exit, so the trade cannot be closed honestly"
             )
 
+        signals, trades = len(signal_log) - signals_before, len(portfolio.trades) - trades_before
+        status = (
+            SessionStatus.TRADED
+            if trades
+            else SessionStatus.SIGNALLED
+            if signals
+            else SessionStatus.NO_SIGNAL
+        )
+        session_log.append(SessionRecord(day, status, signal_count=signals, trade_count=trades))
+
+    if sessions_5m:
+        first, last = min(sessions_5m), max(sessions_5m)
+        span = (first + timedelta(days=offset) for offset in range((last - first).days + 1))
+        session_log.extend(
+            SessionRecord(day, SessionStatus.NO_DATA)
+            for day in span
+            if day not in sessions_5m and data.calendar.is_trading_day(day)
+        )
+        session_log.sort(key=lambda record: record.session)
+
     manifest = RunManifest(
         input_fingerprint=data.fingerprint(),
         strategy_name=active.name,
@@ -235,4 +295,5 @@ def run_backtest(
         trades=portfolio.trades,
         equity_curve=portfolio.equity_curve,
         signal_log=signal_log,
+        session_log=session_log,
     )

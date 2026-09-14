@@ -22,6 +22,8 @@ from app.domain.backtest.models import (
     EquityPoint,
     ExecutionStatus,
     RunManifest,
+    SessionRecord,
+    SessionStatus,
     SignalRecord,
     Trade,
 )
@@ -51,9 +53,11 @@ class BacktestResult:
     trades: tuple[Trade, ...] = ()
     equity_curve: tuple[EquityPoint, ...] = ()
     performance: PerformanceReport | None = None
+    #: One record per calendar trading day of the run, in date order.
+    session_log: tuple[SessionRecord, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("signal_log", "trades", "equity_curve"):
+        for name in ("signal_log", "trades", "equity_curve", "session_log"):
             if not isinstance(getattr(self, name), tuple):
                 raise TypeError(
                     f"{name} must be a tuple; a result is immutable so that it cannot be "
@@ -98,6 +102,7 @@ class BacktestResult:
         equity_curve: Sequence[EquityPoint],
         signal_log: Sequence[SignalRecord] = (),
         quarantined_sessions: int = 0,
+        session_log: Sequence[SessionRecord] = (),
     ) -> BacktestResult:
         """Build a result and measure it in one step.
 
@@ -111,6 +116,7 @@ class BacktestResult:
             signal_log=tuple(signal_log),
             trades=trades,
             equity_curve=equity_curve,
+            session_log=tuple(session_log),
             performance=evaluate_performance(
                 trades, equity_curve, quarantined_sessions=quarantined_sessions
             ),
@@ -147,6 +153,14 @@ class BacktestResult:
             "strategy_version": self.manifest.strategy_version,
             "trade_count": str(len(self.trades)),
         }
+        summary.update(
+            {
+                f"sessions_{status.value}": str(
+                    sum(1 for record in self.session_log if record.status is status)
+                )
+                for status in SessionStatus
+            }
+        )
         if self.performance is not None:
             portfolio = self.performance.portfolio
             summary.update(

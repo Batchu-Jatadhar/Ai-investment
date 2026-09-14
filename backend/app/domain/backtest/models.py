@@ -20,7 +20,7 @@ than a plausible-looking number.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -35,6 +35,8 @@ __all__ = [
     "FillReason",
     "OrderSide",
     "RunManifest",
+    "SessionRecord",
+    "SessionStatus",
     "SignalRecord",
     "Trade",
 ]
@@ -337,3 +339,57 @@ class RunManifest:
         for name in ("strategy_name", "strategy_version", "engine_version"):
             if not getattr(self, name).strip():
                 raise ValueError(f"{name} must be recorded so a run can be identified")
+
+
+class SessionStatus(StrEnum):
+    """What a run made of one calendar trading day. Exactly one per day.
+
+    The first two are about the data; the last three about the strategy on a
+    session whose data could be traded.
+    """
+
+    #: A calendar trading day inside the run with no signal bars at all.
+    NO_DATA = "no_data"
+    #: Bars exist, but the opening window is not fully covered - a special
+    #: session that starts later, or minutes missing from the open. No opening
+    #: range can be formed, so the strategy is never asked and nothing is traded.
+    UNTRADABLE_NO_OPENING_RANGE = "untradable_no_opening_range"
+    #: A valid opening range, and no signal: no breakout, or every setup rejected.
+    NO_SIGNAL = "no_signal"
+    #: At least one signal, but no entry filled.
+    SIGNALLED = "signalled"
+    #: At least one entry filled.
+    TRADED = "traded"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRecord:
+    """One trading day's status, with the signals and trades it produced."""
+
+    session: date
+    status: SessionStatus
+    signal_count: int = 0
+    trade_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.signal_count < 0 or self.trade_count < 0:
+            raise ValueError("signal_count and trade_count must not be negative")
+        expected = (
+            SessionStatus.TRADED
+            if self.trade_count
+            else SessionStatus.SIGNALLED
+            if self.signal_count
+            else None
+        )
+        quiet = (
+            SessionStatus.NO_DATA,
+            SessionStatus.UNTRADABLE_NO_OPENING_RANGE,
+            SessionStatus.NO_SIGNAL,
+        )
+        if expected is None and self.status not in quiet:
+            raise ValueError(f"a session with no signals or trades cannot be {self.status.value}")
+        if expected is not None and self.status is not expected:
+            raise ValueError(
+                f"a session with {self.signal_count} signal(s) and {self.trade_count} trade(s) "
+                f"is {expected.value}, not {self.status.value}"
+            )
