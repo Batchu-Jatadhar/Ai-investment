@@ -16,6 +16,7 @@ reads a clock or the network; bars are fed in by whoever runs the session.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal
@@ -94,8 +95,11 @@ class PaperSession:
         self._session_day: date | None = None
         self._session_bars: list[Candle] = []
 
-    def on_bar(self, bar: Candle, *, prior_atr: Decimal | None) -> Evaluation:
-        fills = self.paper.on_bar(bar)
+    def on_bar(
+        self, bar: Candle, *, prior_atr: Decimal | None, minute_bars: Sequence[Candle] = ()
+    ) -> Evaluation:
+        """``minute_bars`` resolve a same-bar stop/target collision, as in the backtest."""
+        fills = self.paper.on_bar(bar, minute_bars)
 
         day = to_ist(bar.start_at).date()
         if day != self._session_day:

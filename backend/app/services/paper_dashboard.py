@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from app.config.settings import TradingMode
 from app.domain.backtest.execution import target_price
+from app.domain.execution.ports import OrderStatus
 from app.domain.market.session import MarketSessionCalendar
 from app.domain.strategy.contract import Signal
 from app.domain.strategy.orb import OrbReason
@@ -262,6 +263,10 @@ def build_paper_dashboard(
 
     if last.skipped_because is not None:
         blocked.append("A new signal was ignored because a position or order is already open")
+    if last.order is not None and not last.order.reasons:
+        current = paper.order(last.order.client_order_id).status
+        if current is OrderStatus.CANCELLED or current is OrderStatus.EXPIRED:
+            blocked.append(f"The entry order was {current.value} before it could execute")
     if last.order is not None and last.order.reasons:
         blocked.append(f"Paper execution rejected the order: {', '.join(last.order.reasons)}")
 
