@@ -1,6 +1,7 @@
 """Deterministic risk engine. PASS/REJECT with machine-readable reasons.
 
-Status: not implemented. Introduced in Phase 4.
+Implemented: ``sizing`` - risk-budget position sizing with structured rejections.
+It is invoked explicitly; the Phase 2 backtest engine still sizes by fixed notional.
 
 Planned responsibilities:
   * per-trade, daily, portfolio, instrument, session, market gates
