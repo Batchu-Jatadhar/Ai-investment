@@ -44,6 +44,28 @@ than the number:
 ``fixed_notional_inr = 100000``
     A sizing placeholder only. Real position sizing is Phase 3; putting it here
     would make the Phase 2 vs Phase 3 comparison impossible to attribute.
+
+.. rubric:: Hypothesis revisions
+
+``atr_interval`` names the bars the prior ATR is measured on, and it is the only
+thing that separates the two hypotheses:
+
+**ORB v1** (``OrbParams()``) measures ATR(14) on prior completed **5-minute**
+signal bars.
+
+**ORB v2** (:data:`ORB_V2`) measures ATR(14) on prior completed **15-minute**
+bars. It exists because of a structural unit mismatch in v1, not because of its
+results: ``max_range_atr_multiple`` compares a 15-minute opening range against a
+volatility measure, and in v1 that measure is the true range of a single
+5-minute bar, a third of the range's span. A 15-minute range is structurally
+several multiples of one 5-minute bar, so the comparison could almost never
+pass. v2 measures both on the same 15-minute scale. The 1.5 threshold and every
+other value are unchanged, and nothing was tuned.
+
+The two are distinct hypotheses with distinct identities: v2 renders
+``atr_interval`` into the canonical parameters and is reported as strategy
+version ``"2"``. v1's canonical rendering is exactly what it was before v2
+existed, so every v1 fingerprint stays reproducible.
 """
 
 from __future__ import annotations
@@ -55,7 +77,7 @@ from decimal import Decimal
 from app.core.canonical import canonical_decimal
 from app.domain.market.models import CandleInterval
 
-__all__ = ["OrbParams"]
+__all__ = ["ORB_V2", "OrbParams"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +99,9 @@ class OrbParams:
     min_range_ticks: int = 4
     max_range_atr_multiple: Decimal = Decimal("1.5")
     fixed_notional_inr: Decimal = Decimal("100000")
+    #: The bars the prior ATR is measured on: ``None`` for the signal bars (ORB v1),
+    #: or 15m (ORB v2). See :attr:`atr_bars` for the interval actually used.
+    atr_interval: CandleInterval | None = None
 
     def __post_init__(self) -> None:
         for name in ("target_r_multiple", "max_range_atr_multiple", "fixed_notional_inr"):
@@ -126,10 +151,35 @@ class OrbParams:
                 f"hard_exit_time ({self.hard_exit_time.isoformat()}), otherwise a trade could "
                 "be opened at or after the moment it must be closed"
             )
+        if self.atr_interval is not None and (
+            self.atr_interval is not CandleInterval.M15
+            or self.signal_interval.seconds >= CandleInterval.M15.seconds
+        ):
+            raise ValueError(
+                f"atr_interval must be None (ATR on the signal bars, ORB v1) or 15m over a finer "
+                f"signal interval (ORB v2), got {self.atr_interval.value} with "
+                f"{self.signal_interval.value} signal bars"
+            )
+
+    @property
+    def hypothesis_version(self) -> str:
+        """``"1"`` when ATR is measured on the signal bars, ``"2"`` when on 15m bars."""
+        return "1" if self.atr_interval is None else "2"
+
+    @property
+    def atr_bars(self) -> CandleInterval:
+        """The interval of the bars the prior ATR is computed over."""
+        return self.signal_interval if self.atr_interval is None else self.atr_interval
 
     def canonical(self) -> dict[str, str]:
-        """Deterministic rendering for fingerprints and run manifests."""
-        return {
+        """Deterministic rendering for fingerprints and run manifests.
+
+        ``atr_interval`` is rendered only for v2. Omitting it for v1 keeps v1's
+        rendering byte-for-byte what it was before v2 existed, so no v1
+        fingerprint changed; v2 inputs cannot collide with v1 because they carry
+        the extra key.
+        """
+        rendered = {
             "fixed_notional_inr": canonical_decimal(self.fixed_notional_inr),
             "hard_exit_time": self.hard_exit_time.isoformat(),
             "max_range_atr_multiple": canonical_decimal(self.max_range_atr_multiple),
@@ -140,3 +190,10 @@ class OrbParams:
             "signal_interval": self.signal_interval.value,
             "target_r_multiple": canonical_decimal(self.target_r_multiple),
         }
+        if self.atr_interval is not None:
+            rendered["atr_interval"] = self.atr_interval.value
+        return rendered
+
+
+ORB_V2 = OrbParams(atr_interval=CandleInterval.M15)
+"""ORB v2: v1 with the prior ATR measured on 15-minute bars. See the module docstring."""

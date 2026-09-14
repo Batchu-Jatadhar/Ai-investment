@@ -156,7 +156,12 @@ class OrbStrategy:
     params: OrbParams = field(default_factory=OrbParams)
 
     name: ClassVar[str] = "orb"
-    version: ClassVar[str] = "1"
+    #: The hypothesis version, "1" or "2", taken from the params so the manifest
+    #: names the hypothesis that ran. Derived, never passed in.
+    version: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "version", self.params.hypothesis_version)
 
     def on_bar(self, session_bars: Sequence[Candle], context: StrategyContext) -> Signal | None:
         """The contract entry point: the signal, if one fired."""

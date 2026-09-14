@@ -105,6 +105,55 @@ def edit_row(
 MON, TUE, WED, THU, FRI = (date(2026, 8, day) for day in (3, 4, 5, 6, 7))
 
 
+def test_v2_warmup_needs_fifteen_complete_15m_bars_and_is_refused_deterministically(
+    repository,  # noqa: ANN001
+) -> None:
+    """80 warmup minutes are 16 5m bars (enough for v1) but only 5 complete 15m bars.
+    v2 refuses the same range, the same way every time; 225 minutes (15 bars) pass."""
+    from app.domain.strategy.params import ORB_V2
+
+    store(repository, MON, 80)
+    store(repository, TUE, 80)
+    assert load(repository, MON, TUE, WED).backtest_input.prior_atr(TUE) is not None  # v1
+
+    def load_v2():  # noqa: ANN202
+        return load_backtest_input(
+            repository,
+            RELIANCE,
+            warmup_start=midnight(MON),
+            start=midnight(TUE),
+            end=midnight(WED),
+            strategy_params=ORB_V2,
+            cost_schedule=NSE_INTRADAY_EQUITY,
+            slippage_config=SlippageConfig(),
+            execution_config=ExecutionConfig(),
+            calendar=MarketSessionCalendar.nse_equity(),
+        )
+
+    messages = []
+    for _ in range(2):
+        with pytest.raises(InsufficientWarmupError, match="15 completed 15m bars") as exc:
+            load_v2()
+        messages.append(str(exc.value))
+    assert messages[0] == messages[1] and "holds 5" in messages[0]
+
+    store(repository, THU, 225)
+    store(repository, FRI, 30)
+    loaded = load_backtest_input(
+        repository,
+        RELIANCE,
+        warmup_start=midnight(THU),
+        start=midnight(FRI),
+        end=midnight(date(2026, 8, 8)),
+        strategy_params=ORB_V2,
+        cost_schedule=NSE_INTRADAY_EQUITY,
+        slippage_config=SlippageConfig(),
+        execution_config=ExecutionConfig(),
+        calendar=MarketSessionCalendar.nse_equity(),
+    )
+    assert loaded.backtest_input.prior_atr(FRI) is not None
+
+
 def test_a_long_range_loads_completely_through_pagination(repository) -> None:  # noqa: ANN001
     """14 full sessions: 5,250 minutes and 1,050 five-minute bars, read 1,000 at a time."""
     days = [date(2026, 8, d) for d in (3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 20)]

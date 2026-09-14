@@ -11,7 +11,7 @@ import pytest
 
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.market.models import CandleInterval
-from app.domain.strategy.params import OrbParams
+from app.domain.strategy.params import ORB_V2, OrbParams
 
 
 class TestApprovedDefaults:
@@ -121,7 +121,12 @@ class TestCanonicalRendering:
         assert all(isinstance(k, str) and isinstance(v, str) for k, v in rendered.items())
 
     def test_canonical_covers_every_field(self) -> None:
-        assert set(OrbParams().canonical()) == {f.name for f in dataclasses.fields(OrbParams)}
+        """v2 renders every field. v1 renders every field except ``atr_interval``,
+        which it leaves out so its canonical form, and every v1 fingerprint, is
+        exactly what it was before v2 existed."""
+        fields = {f.name for f in dataclasses.fields(OrbParams)}
+        assert set(ORB_V2.canonical()) == fields
+        assert set(OrbParams().canonical()) == fields - {"atr_interval"}
 
     def test_logically_equal_decimals_render_identically(self) -> None:
         a = OrbParams(target_r_multiple=Decimal("2.0"))

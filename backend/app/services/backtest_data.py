@@ -7,8 +7,9 @@ range is read through :meth:`MarketDataRepository.candles_page`, following
 .. rubric:: Warmup and the backtest window
 
 The strategy's range filter needs a prior ATR, which
-:meth:`BacktestInput.prior_atr` derives from completed signal bars *before*
-each session. So a run covers two spans, stated separately:
+:meth:`BacktestInput.prior_atr` derives from completed bars *before* each
+session - signal bars for ORB v1, 15-minute bars built from the minutes for v2.
+So a run covers two spans, stated separately:
 
 *   ``[warmup_start, start)`` - warmup. Loaded into the input so the first
     session of the window has an ATR, and it must not be traded itself.
@@ -220,10 +221,15 @@ def load_backtest_input(
 
     first = trading_sessions[0]
     if backtest_input.prior_atr(first) is None:
-        available = sum(1 for c in signal if to_ist(c.start_at).date() < first)
+        atr_interval = strategy_params.atr_bars
+        if strategy_params.hypothesis_version == "1":
+            available = sum(1 for c in signal if to_ist(c.start_at).date() < first)
+        else:
+            prior_minutes = [c for c in minutes if to_ist(c.start_at).date() < first]
+            available = len(aggregate_minutes(prior_minutes, atr_interval).candles)
         raise InsufficientWarmupError(
             f"the first backtest session {first.isoformat()} needs at least "
-            f"{DEFAULT_ATR_PERIOD + 1} completed {signal_interval.value} bars before it for its "
+            f"{DEFAULT_ATR_PERIOD + 1} completed {atr_interval.value} bars before it for its "
             f"ATR, but the warmup from {warmup_start.isoformat()} holds {available}; "
             "load an earlier warmup_start"
         )
