@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI Investment — Intraday Trading System",
-  description: "Phase 0 foundation. Live trading is not implemented.",
+  title: "PAPER Dashboard — AI Investment",
+  description: "PAPER-mode trader dashboard. Live trading is not implemented.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {

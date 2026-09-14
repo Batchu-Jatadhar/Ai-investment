@@ -157,6 +157,7 @@ __all__ = [
     "resolve_hard_exit_fill",
     "resolve_stop_fill",
     "resolve_target_fill",
+    "target_price",
 ]
 
 
@@ -415,8 +416,7 @@ def resolve_target_fill(
             "describes a target; such a trade should never have been opened"
         )
 
-    reach = intent.signal.target_r_multiple * risk
-    target = entry.price + reach if is_long else entry.price - reach
+    target = target_price(intent.signal, entry.price)
     through = execution.target_requires_through_ticks * tick_size
     trigger = target + through if is_long else target - through
 
@@ -440,6 +440,12 @@ def resolve_target_fill(
         occurred_at=bar.end_at,
         bar_start=bar.start_at,
     )
+
+
+def target_price(signal: Signal, entry_price: Decimal) -> Decimal:
+    """The target level: ``target_r_multiple`` of the entry-to-stop distance beyond the entry."""
+    reach = signal.target_r_multiple * abs(entry_price - signal.stop_price)
+    return entry_price + reach if signal.direction.is_long else entry_price - reach
 
 
 def _leg_cost(schedule: CostSchedule, side: OrderSide, price: Decimal, quantity: int) -> Decimal:

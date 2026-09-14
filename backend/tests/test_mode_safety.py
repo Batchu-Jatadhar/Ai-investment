@@ -145,9 +145,10 @@ class TestNoExecutionSurface:
         assert mutating == [f"POST {WEBHOOK_PATH}"], f"unexpected write endpoints: {mutating}"
 
     def test_only_known_surfaces_are_exposed(self, app: FastAPI) -> None:
-        """Health, read-only market-data queries and the alert webhook. Nothing else."""
+        """Health, read-only market data, the PAPER dashboard and the webhook. Nothing else."""
         assert self._published_paths(app) == {
             WEBHOOK_PATH,
+            "/dashboard/paper",
             "/health",
             "/health/db",
             "/health/market-data",

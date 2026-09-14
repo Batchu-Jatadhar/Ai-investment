@@ -89,6 +89,16 @@ class PaperExecutionAdapter:
     def cash(self) -> Decimal:
         return self._ledger.cash
 
+    @property
+    def held_signal(self) -> Signal | None:
+        """The signal behind the held position, whose stop and target are armed."""
+        return self._intent.signal if self._intent is not None else None
+
+    @property
+    def working_order(self) -> OrderRecord | None:
+        """The accepted entry still waiting for its bar, if any."""
+        return self._orders[self._working] if self._working is not None else None
+
     def order(self, client_order_id: str) -> OrderRecord:
         try:
             return self._orders[client_order_id]
