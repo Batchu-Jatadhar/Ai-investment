@@ -11,26 +11,38 @@ becomes a candle, and a single bad row fails the whole response with
 :class:`ZerodhaProtocolError` rather than being skipped: a gap silently left in
 the middle of a price series is worse than a fetch that visibly failed.
 
-.. rubric:: Verified live behaviour (read-only smoke tests, September 2026)
+.. rubric:: Observed live coverage (read-only backfill, September 2026)
 
-Two real ``minute`` requests for NSE:RELIANCE (token 738561), each asking for
-``09:15:00`` to ``15:30:00`` IST on a trading day (2026-09-10 and 2026-09-11),
-returned the same shape:
+A real ``minute`` backfill of NSE:RELIANCE (token 738561) over 2026-06-11 to
+2026-09-11, requested in whole IST days, returned two different session lengths,
+split cleanly by date:
 
-*   ``data`` holds only a ``candles`` list of 6-field rows, timestamps carry
-    ``+0530``, and prices arrive as JSON decimals or, when whole, as integers;
-*   360 contiguous one-minute bars, the first starting 09:15 IST and the last
-    starting **15:14 IST, so the data ends at 15:15 IST** - no bars for
-    15:15-15:30 were returned, although the request covered them;
-*   the parser accepted every row, and the bars aggregate into 72 complete
-    5-minute bars.
+=========================  ========  ===================  ========================
+Dates                      Sessions  One-minute bars      Last bar
+=========================  ========  ===================  ========================
+2026-06-11 to 2026-07-31   36        375 per session      starts 15:29, ends 15:30
+2026-08-03 to 2026-09-11   30        360 per session      starts 15:14, ends 15:15
+=========================  ========  ===================  ========================
 
-Treat 15:15 IST as the currently verified end of this data path. It is evidence
-from one instrument on two sessions, not a guarantee for every instrument or
-date, so nothing here depends on it: the parser neither expects 375 bars nor
-pads the missing tail, and a session that does return bars to 15:30 is parsed
-the same way. Downstream, the 15:15 hard exit still has its 15:10-15:15 bar, but
-any rule that needs a 15:15-15:30 bar from this source will not find one.
+Every session started at 09:15 IST with no missing minute inside the bars
+returned, and the two groups did not interleave. 2026-06-26 returned no bars and
+was reported as a no-data session. In both groups ``data`` held only a
+``candles`` list of 6-field rows, timestamps carried ``+0530``, whole prices
+arrived as JSON integers, the parser accepted every row, and the minutes
+aggregated into complete 5-minute and 15-minute bars.
+
+Why the later sessions stop at 15:15 is not known - it may be a change in what
+Kite serves, or a delay before the last quarter-hour of recent sessions is
+published. This is evidence from one instrument over one range, not a rule for
+every instrument or date.
+
+So the client trusts the coverage a response actually contains. Nothing here
+assumes a fixed session length or end time: the parser neither expects 375 bars
+nor pads a short session, and a 15:30 session and a 15:15 session are parsed the
+same way. Code downstream must do the same - read coverage from the stored bars
+rather than infer it from the exchange's published close. The ORB 15:15 hard
+exit has its 15:10-15:15 bar under both shapes; a rule needing a 15:15-15:30 bar
+will not find one in the later sessions.
 """
 
 from __future__ import annotations

@@ -153,14 +153,24 @@ async def test_rows_outside_the_requested_window_are_filtered() -> None:
     assert [c.start_at for c in candles] == [OPEN_UTC, OPEN_UTC + timedelta(minutes=10)]
 
 
-async def test_the_verified_live_minute_session_shape_is_parsed_without_padding() -> None:
-    """The shape two real RELIANCE sessions returned for 09:15-15:30 IST: 360 minutes,
-    +0530 timestamps, a whole-number price sent as a JSON integer, and nothing after
-    the bar starting 15:14 IST. The parser keeps all 360, invents no 15:15-15:30 bars,
-    and the minutes still aggregate into complete 5-minute bars."""
+@pytest.mark.parametrize(
+    ("bars", "five_minute", "fifteen_minute"),
+    [
+        pytest.param(375, 75, 25, id="to-1530-as-june-july-2026"),
+        pytest.param(360, 72, 24, id="to-1515-as-august-september-2026"),
+    ],
+)
+async def test_observed_live_session_shapes_are_parsed_as_returned(
+    bars: int, five_minute: int, fifteen_minute: int
+) -> None:
+    """Both session shapes a real RELIANCE backfill returned for 09:15-15:30 IST
+    requests: +0530 timestamps, a whole price sent as a JSON integer, and either 375
+    minutes to 15:30 or 360 minutes to 15:15. The parser keeps exactly the bars
+    returned - it neither pads the short session nor expects the long one - and the
+    minutes aggregate into complete 5- and 15-minute bars either way."""
     from app.domain.market.aggregation import aggregate_minutes
 
-    minutes = [OPEN_UTC + timedelta(minutes=i) for i in range(360)]
+    minutes = [OPEN_UTC + timedelta(minutes=i) for i in range(bars)]
     rows = [
         '["2026-08-21T09:15:00+0530", 1267, 1267.4, 1261.5, 1262.7, 188567]',
         *(
@@ -173,14 +183,18 @@ async def test_the_verified_live_minute_session_shape_is_parsed_without_padding(
 
     candles, _ = await fetch(body(*rows), interval=CandleInterval.M1, end=session_end)
 
-    assert len(candles) == 360
+    assert len(candles) == bars
     assert [c.start_at for c in candles] == minutes
-    assert candles[-1].end_at == OPEN_UTC + timedelta(hours=6)  # 15:15 IST, not 15:30
+    assert candles[-1].end_at == OPEN_UTC + timedelta(minutes=bars)  # 15:30 or 15:15 IST
     first = candles[0]
     assert (first.open, first.high) == (Decimal("1267"), Decimal("1267.4"))
     assert isinstance(first.open, Decimal) and isinstance(candles[1].high, Decimal)
-    aggregated = aggregate_minutes(candles, CandleInterval.M5)
-    assert (len(aggregated.candles), aggregated.incomplete) == (72, ())
+    for interval, expected in (
+        (CandleInterval.M5, five_minute),
+        (CandleInterval.M15, fifteen_minute),
+    ):
+        aggregated = aggregate_minutes(candles, interval)
+        assert (len(aggregated.candles), aggregated.incomplete) == (expected, ())
 
 
 @pytest.mark.parametrize(
