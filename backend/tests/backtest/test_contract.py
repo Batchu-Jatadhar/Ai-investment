@@ -212,6 +212,7 @@ class TestStrategyContext:
             "session_open",
             "session_close",
             "prior_atr",
+            "round_trip_friction",
         }
 
     def test_prior_atr_is_optional_because_history_may_be_too_short(self) -> None:

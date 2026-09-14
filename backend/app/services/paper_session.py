@@ -20,11 +20,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal
+from functools import partial
 
 from app.adapters.paper import PaperExecutionAdapter
 from app.config.settings import TradingMode
 from app.core.time import to_ist
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
+from app.domain.backtest.costs import estimate_round_trip_friction
 from app.domain.backtest.models import Fill
 from app.domain.execution.ports import OrderRecord
 from app.domain.market.models import Candle, Instrument
@@ -91,6 +93,14 @@ class PaperSession:
         )
         assert isinstance(port, PaperExecutionAdapter)
         self.paper = port
+        self._round_trip_friction = partial(
+            estimate_round_trip_friction,
+            schedule=cost_schedule,
+            notional=self.params.fixed_notional_inr,
+            lot_size=instrument.lot_size,
+            tick_size=instrument.tick_size,
+            adverse_ticks=(slippage or SlippageConfig()).adverse_ticks,
+        )
         self.last: Evaluation | None = None
         self._session_day: date | None = None
         self._session_bars: list[Candle] = []
@@ -116,6 +126,7 @@ class PaperSession:
             session_open=bounds[0],
             session_close=bounds[1],
             prior_atr=prior_atr,
+            round_trip_friction=self._round_trip_friction,
         )
         decision = self.strategy.evaluate(bars, context)
         evaluation = Evaluation(

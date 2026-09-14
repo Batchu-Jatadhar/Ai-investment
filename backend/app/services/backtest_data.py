@@ -39,7 +39,7 @@ from datetime import date, datetime, time, timedelta
 from app.core.time import ensure_utc, to_ist
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.backtest.input import BacktestInput
-from app.domain.indicators import DEFAULT_ATR_PERIOD
+from app.domain.indicators import DEFAULT_ATR_PERIOD, session_bars
 from app.domain.market.aggregation import aggregate_minutes
 from app.domain.market.models import Candle, CandleInterval, CandleStatus, Instrument
 from app.domain.market.ports import MarketDataRepository
@@ -221,15 +221,22 @@ def load_backtest_input(
 
     first = trading_sessions[0]
     if backtest_input.prior_atr(first) is None:
-        atr_interval = strategy_params.atr_bars
-        if strategy_params.hypothesis_version == "1":
+        version = strategy_params.hypothesis_version
+        prior_minutes = [c for c in minutes if to_ist(c.start_at).date() < first]
+        if version == "3":
+            bar_kind = "complete session"
+            available = len(
+                session_bars(prior_minutes, calendar, window_end=strategy_params.hard_exit_time)
+            )
+        elif version == "1":
+            bar_kind = f"completed {signal_interval.value}"
             available = sum(1 for c in signal if to_ist(c.start_at).date() < first)
         else:
-            prior_minutes = [c for c in minutes if to_ist(c.start_at).date() < first]
-            available = len(aggregate_minutes(prior_minutes, atr_interval).candles)
+            bar_kind = f"completed {strategy_params.atr_bars.value}"
+            available = len(aggregate_minutes(prior_minutes, strategy_params.atr_bars).candles)
         raise InsufficientWarmupError(
             f"the first backtest session {first.isoformat()} needs at least "
-            f"{DEFAULT_ATR_PERIOD + 1} completed {atr_interval.value} bars before it for its "
+            f"{DEFAULT_ATR_PERIOD + 1} {bar_kind} bars before it for its "
             f"ATR, but the warmup from {warmup_start.isoformat()} holds {available}; "
             "load an earlier warmup_start"
         )

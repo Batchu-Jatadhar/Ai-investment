@@ -22,19 +22,25 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
+from itertools import groupby
+from typing import Protocol
 
 from app.core.time import ist_datetime, to_ist
-from app.domain.market.models import Candle, CandleStatus
+from app.domain.market.aggregation import aggregate_minutes
+from app.domain.market.models import Candle, CandleInterval, CandleStatus
 from app.domain.market.session import MarketSessionCalendar
 
 __all__ = [
     "DEFAULT_ATR_PERIOD",
     "IndicatorError",
     "OpeningRange",
+    "SessionBar",
     "average_true_range",
     "opening_range",
+    "session_average_true_range",
+    "session_bars",
     "true_range",
 ]
 
@@ -96,7 +102,14 @@ def _validate_bars(candles: Sequence[Candle], label: str) -> None:
         previous = candle
 
 
-def true_range(candle: Candle, previous_close: Decimal) -> Decimal:
+class _Ranged(Protocol):
+    @property
+    def high(self) -> Decimal: ...
+    @property
+    def low(self) -> Decimal: ...
+
+
+def true_range(candle: _Ranged, previous_close: Decimal) -> Decimal:
     """Wilder's true range for one bar.
 
     The two gap terms are what distinguish this from the bar's own high-low
@@ -146,13 +159,92 @@ def average_true_range(candles: Sequence[Candle], period: int = DEFAULT_ATR_PERI
         )
 
     ranges = [true_range(candle, candles[index].close) for index, candle in enumerate(candles[1:])]
+    return _wilder(ranges, period)
 
+
+def _wilder(ranges: Sequence[Decimal], period: int) -> Decimal:
+    """Seed with the mean of the first ``period`` true ranges, then Wilder's recurrence."""
     with localcontext(_CONTEXT):
         divisor = Decimal(period)
         atr = sum(ranges[:period], Decimal(0)) / divisor
         for value in ranges[period:]:
             atr = (atr * Decimal(period - 1) + value) / divisor
         return +atr
+
+
+@dataclass(frozen=True, slots=True)
+class SessionBar:
+    """One tradable session's high, low and close, from 09:15 to a fixed cutoff."""
+
+    session: date
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+
+def session_bars(
+    minutes: Sequence[Candle], calendar: MarketSessionCalendar, *, window_end: time
+) -> tuple[SessionBar, ...]:
+    """One bar per session whose 1-minute bars fully cover session open to ``window_end`` IST.
+
+    The minutes are grouped by IST date and, inside ``[open, window_end)``,
+    aggregated into 15-minute bars by :func:`aggregate_minutes`. A session gets a
+    bar only when every one of those slots is complete; a session missing any
+    minute of the window gets none, and nothing is filled in. Minutes outside the
+    window - after a 15:15 cutoff, say - never contribute. The bar's close is the
+    last minute's close before ``window_end``.
+
+    Sessions come back in ascending date order. ``minutes`` must be completed,
+    ascending 1-minute bars of one instrument; :func:`aggregate_minutes`
+    validates that.
+    """
+    bars: list[SessionBar] = []
+    slot = CandleInterval.M15.delta
+    for day, grouped in groupby(minutes, key=lambda m: to_ist(m.start_at).date()):
+        if not calendar.is_trading_day(day):
+            continue
+        opens = ist_datetime(day, calendar.window.open_time)
+        closes = ist_datetime(day, window_end)
+        span = closes - opens
+        if span <= timedelta(0) or span % slot:
+            raise IndicatorError(
+                f"a session window from {calendar.window.open_time} to {window_end} is not a "
+                "whole number of 15-minute slots"
+            )
+        inside = [m for m in grouped if opens <= m.start_at and m.end_at <= closes]
+        aggregated = aggregate_minutes(inside, CandleInterval.M15)
+        if aggregated.incomplete or len(aggregated.candles) != span // slot:
+            continue
+        bars.append(
+            SessionBar(
+                session=day,
+                high=max(c.high for c in aggregated.candles),
+                low=min(c.low for c in aggregated.candles),
+                close=aggregated.candles[-1].close,
+            )
+        )
+    return tuple(bars)
+
+
+def session_average_true_range(
+    bars: Sequence[SessionBar], period: int = DEFAULT_ATR_PERIOD
+) -> Decimal:
+    """Wilder ATR over session bars, with :func:`average_true_range`'s true range and smoothing.
+
+    Needs at least ``period + 1`` bars in strictly ascending session order.
+    """
+    if period < 1:
+        raise IndicatorError(f"period must be at least 1, got {period}")
+    if len(bars) < period + 1:
+        raise IndicatorError(
+            f"ATR({period}) needs at least {period + 1} session bars, got {len(bars)}"
+        )
+    if any(
+        later.session <= earlier.session for earlier, later in zip(bars, bars[1:], strict=False)
+    ):
+        raise IndicatorError("session bars must be in strictly ascending session order")
+    ranges = [true_range(bar, bars[index].close) for index, bar in enumerate(bars[1:])]
+    return _wilder(ranges, period)
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,7 +11,7 @@ import pytest
 
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
 from app.domain.market.models import CandleInterval
-from app.domain.strategy.params import ORB_V2, OrbParams
+from app.domain.strategy.params import ORB_V2, ORB_V3, OrbParams
 
 
 class TestApprovedDefaults:
@@ -121,12 +121,14 @@ class TestCanonicalRendering:
         assert all(isinstance(k, str) and isinstance(v, str) for k, v in rendered.items())
 
     def test_canonical_covers_every_field(self) -> None:
-        """v2 renders every field. v1 renders every field except ``atr_interval``,
-        which it leaves out so its canonical form, and every v1 fingerprint, is
-        exactly what it was before v2 existed."""
+        """Each version renders the shared fields plus only its own. v1 leaves out
+        every later field, so its canonical form - and every v1 fingerprint - is
+        exactly what it was before v2 and v3 existed; v2 likewise before v3."""
         fields = {f.name for f in dataclasses.fields(OrbParams)}
-        assert set(ORB_V2.canonical()) == fields
-        assert set(OrbParams().canonical()) == fields - {"atr_interval"}
+        later = {"atr_interval", "session_atr", "max_friction_r"}
+        assert set(OrbParams().canonical()) == fields - later
+        assert set(ORB_V2.canonical()) == fields - {"session_atr", "max_friction_r"}
+        assert set(ORB_V3.canonical()) == fields - {"atr_interval"}
 
     def test_logically_equal_decimals_render_identically(self) -> None:
         a = OrbParams(target_r_multiple=Decimal("2.0"))

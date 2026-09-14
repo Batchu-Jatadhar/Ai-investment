@@ -66,6 +66,25 @@ The two are distinct hypotheses with distinct identities: v2 renders
 ``atr_interval`` into the canonical parameters and is reported as strategy
 version ``"2"``. v1's canonical rendering is exactly what it was before v2
 existed, so every v1 fingerprint stays reproducible.
+
+**ORB v3** (:data:`ORB_V3`) replaces the range-width filter with two conditions
+derived from the trade's structure and the cost model, not from results:
+
+*   **Reachability.** ATR(14) is measured on prior *session* bars built from
+    complete 09:15 to ``hard_exit_time`` minute coverage - the tradable day. A
+    winning trade travels the opening range plus ``target_r_multiple`` times it,
+    so the range must satisfy ``width x (1 + target_r_multiple) <= ATR``. There
+    is no free multiple: the ceiling follows from the frozen 2R target, and
+    ``max_range_atr_multiple`` is not used by v3.
+*   **Friction.** Estimated round-trip friction per share - statutory charges
+    on a buy and a sell leg at ``fixed_notional_inr`` and the opening-range
+    boundary price, plus two adverse slippage legs - must not exceed
+    ``max_friction_r`` (0.10) times the range width. On a 1R stop and 2R target,
+    friction ``f`` in R raises the break-even win rate to ``(1 + f) / 3``.
+
+Every other value is v2's. v3 renders ``session_atr`` and ``max_friction_r``
+into its canonical parameters and is reported as strategy version ``"3"``; v1
+and v2 renderings are unchanged.
 """
 
 from __future__ import annotations
@@ -77,7 +96,7 @@ from decimal import Decimal
 from app.core.canonical import canonical_decimal
 from app.domain.market.models import CandleInterval
 
-__all__ = ["ORB_V2", "OrbParams"]
+__all__ = ["ORB_V2", "ORB_V3", "OrbParams"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +121,10 @@ class OrbParams:
     #: The bars the prior ATR is measured on: ``None`` for the signal bars (ORB v1),
     #: or 15m (ORB v2). See :attr:`atr_bars` for the interval actually used.
     atr_interval: CandleInterval | None = None
+    #: ORB v3: ATR on prior session bars (09:15 to the hard exit) and the two
+    #: structural filters. ``max_friction_r`` is set exactly when this is.
+    session_atr: bool = False
+    max_friction_r: Decimal | None = None
 
     def __post_init__(self) -> None:
         for name in ("target_r_multiple", "max_range_atr_multiple", "fixed_notional_inr"):
@@ -161,9 +184,23 @@ class OrbParams:
                 f"{self.signal_interval.value} signal bars"
             )
 
+        if self.session_atr:
+            if self.atr_interval is not None:
+                raise ValueError(
+                    "session_atr (ORB v3) cannot be combined with atr_interval (ORB v2)"
+                )
+            if not isinstance(self.max_friction_r, Decimal):
+                raise TypeError("ORB v3 needs max_friction_r as a Decimal, never float or None")
+            if not Decimal(0) < self.max_friction_r < Decimal(1):
+                raise ValueError(f"max_friction_r must be in (0, 1), got {self.max_friction_r}")
+        elif self.max_friction_r is not None:
+            raise ValueError("max_friction_r belongs to ORB v3 and needs session_atr=True")
+
     @property
     def hypothesis_version(self) -> str:
-        """``"1"`` when ATR is measured on the signal bars, ``"2"`` when on 15m bars."""
+        """``"1"`` ATR on signal bars, ``"2"`` on 15m bars, ``"3"`` on session bars."""
+        if self.session_atr:
+            return "3"
         return "1" if self.atr_interval is None else "2"
 
     @property
@@ -192,8 +229,14 @@ class OrbParams:
         }
         if self.atr_interval is not None:
             rendered["atr_interval"] = self.atr_interval.value
+        if self.session_atr and self.max_friction_r is not None:
+            rendered["session_atr"] = "true"
+            rendered["max_friction_r"] = canonical_decimal(self.max_friction_r)
         return rendered
 
 
 ORB_V2 = OrbParams(atr_interval=CandleInterval.M15)
 """ORB v2: v1 with the prior ATR measured on 15-minute bars. See the module docstring."""
+
+ORB_V3 = OrbParams(session_atr=True, max_friction_r=Decimal("0.10"))
+"""ORB v3: session-bar ATR with the reachability and friction filters. See the module docstring."""

@@ -41,6 +41,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import ClassVar
 
@@ -108,6 +109,10 @@ class OrbReason(StrEnum):
     ATR_UNAVAILABLE = "ATR_UNAVAILABLE"
     ENTRY_CUTOFF_REACHED = "ENTRY_CUTOFF_REACHED"
     DIRECTION_ALREADY_SIGNALLED = "DIRECTION_ALREADY_SIGNALLED"
+    #: ORB v3: estimated round-trip friction exceeds ``max_friction_r`` of the range.
+    FRICTION_TOO_HIGH = "FRICTION_TOO_HIGH"
+    #: ORB v3: friction could not be estimated, so the setup cannot be cleared.
+    FRICTION_UNAVAILABLE = "FRICTION_UNAVAILABLE"
 
     @classmethod
     def for_direction(cls, direction: SignalDirection) -> OrbReason:
@@ -156,7 +161,7 @@ class OrbStrategy:
     params: OrbParams = field(default_factory=OrbParams)
 
     name: ClassVar[str] = "orb"
-    #: The hypothesis version, "1" or "2", taken from the params so the manifest
+    #: The hypothesis version, "1", "2" or "3", taken from the params so the manifest
     #: names the hypothesis that ran. Derived, never passed in.
     version: str = field(init=False)
 
@@ -206,7 +211,7 @@ class OrbStrategy:
         if self._already_signalled(session_bars, measured, direction, context):
             return OrbDecision(None, OrbReason.DIRECTION_ALREADY_SIGNALLED)
 
-        rejection = self._rejection(current, measured, context)
+        rejection = self._rejection(current, measured, direction, context)
         if rejection is not None:
             return OrbDecision(None, rejection)
 
@@ -247,12 +252,16 @@ class OrbStrategy:
         for earlier in session_bars[:-1]:
             if breakout_direction(earlier, measured) is not direction:
                 continue
-            if self._rejection(earlier, measured, context) is None:
+            if self._rejection(earlier, measured, direction, context) is None:
                 return True
         return False
 
     def _rejection(
-        self, candle: Candle, measured: OpeningRange, context: StrategyContext
+        self,
+        candle: Candle,
+        measured: OpeningRange,
+        direction: SignalDirection,
+        context: StrategyContext,
     ) -> OrbReason | None:
         """Why this breakout must not be traded, or ``None`` to take it.
 
@@ -278,7 +287,11 @@ class OrbStrategy:
             # trade the days the filter exists to skip.
             return OrbReason.ATR_UNAVAILABLE
 
-        if measured.width > params.max_range_atr_multiple * context.prior_atr:
+        if params.hypothesis_version == "3":
+            v3 = self._v3_rejection(measured, direction, context.prior_atr, context)
+            if v3 is not None:
+                return v3
+        elif measured.width > params.max_range_atr_multiple * context.prior_atr:
             # A range this wide relative to normal movement puts a 2R target
             # further away than the instrument usually travels in a day.
             return OrbReason.RANGE_TOO_WIDE
@@ -289,6 +302,38 @@ class OrbStrategy:
             # land at or before the cutoff.
             return OrbReason.ENTRY_CUTOFF_REACHED
 
+        return None
+
+    def _v3_rejection(
+        self,
+        measured: OpeningRange,
+        direction: SignalDirection,
+        prior_atr: Decimal,
+        context: StrategyContext,
+    ) -> OrbReason | None:
+        """ORB v3's reachability and friction filters. See ``params.py``.
+
+        Reachability: a winning trade travels the range plus ``target_r_multiple``
+        times it, so ``width x (1 + target_r_multiple)`` must fit in the prior
+        session ATR. Friction: the estimated round trip at the breakout boundary
+        must not exceed ``max_friction_r`` of the width. Both compare by
+        multiplication, so no division rounds a boundary case.
+        """
+        params = self.params
+        if measured.width * (1 + params.target_r_multiple) > prior_atr:
+            return OrbReason.RANGE_TOO_WIDE
+
+        boundary = measured.high if direction.is_long else measured.low
+        friction = (
+            context.round_trip_friction(boundary)
+            if context.round_trip_friction is not None
+            else None
+        )
+        if friction is None:
+            return OrbReason.FRICTION_UNAVAILABLE
+        assert params.max_friction_r is not None  # guaranteed for v3 by OrbParams
+        if friction > params.max_friction_r * measured.width:
+            return OrbReason.FRICTION_TOO_HIGH
         return None
 
     def _signal(

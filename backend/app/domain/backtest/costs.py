@@ -31,8 +31,9 @@ from decimal import ROUND_HALF_UP, Context, Decimal, localcontext
 
 from app.domain.backtest.config import CostSchedule
 from app.domain.backtest.models import OrderSide
+from app.domain.backtest.sizing import PositionSizeError, fixed_notional_quantity
 
-__all__ = ["LegCharges", "leg_charges"]
+__all__ = ["LegCharges", "estimate_round_trip_friction", "leg_charges"]
 
 #: One paisa. Every charge on a contract note is quoted to this.
 _PAISA = Decimal("0.01")
@@ -135,3 +136,36 @@ def leg_charges(
         stamp_duty=stamp_duty,
         gst=gst,
     )
+
+
+def estimate_round_trip_friction(
+    price: Decimal,
+    *,
+    schedule: CostSchedule,
+    notional: Decimal,
+    lot_size: int,
+    tick_size: Decimal,
+    adverse_ticks: int,
+) -> Decimal | None:
+    """Estimated friction per share of one round trip at ``price``, or ``None``.
+
+    The ORB v3 friction filter's input, knowable before the trade: statutory
+    charges on a buy leg and a sell leg, each at the fixed-notional quantity and
+    ``price``, divided by that quantity, plus ``adverse_ticks`` of slippage on each
+    of the two legs. The same :func:`leg_charges` and fixed-notional sizing the
+    backtest charges fills with, so the estimate and the charge cannot drift apart.
+
+    ``None`` when the notional cannot buy one lot at ``price``: there is no
+    quantity to spread the charges over, and no friction to compare.
+    """
+    try:
+        quantity = fixed_notional_quantity(price, notional=notional, lot_size=lot_size)
+    except PositionSizeError:
+        return None
+    turnover = price * Decimal(quantity)
+    charges = (
+        leg_charges(schedule, side=OrderSide.BUY, turnover=turnover).total
+        + leg_charges(schedule, side=OrderSide.SELL, turnover=turnover).total
+    )
+    with localcontext(_CONTEXT):
+        return charges / Decimal(quantity) + 2 * adverse_ticks * tick_size

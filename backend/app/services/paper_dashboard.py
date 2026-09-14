@@ -42,6 +42,8 @@ _STRATEGY_TEXT = {
     OrbReason.ATR_UNAVAILABLE: "Not enough history for ATR; the strategy will not trade",
     OrbReason.ENTRY_CUTOFF_REACHED: "Past the last entry time for the session",
     OrbReason.DIRECTION_ALREADY_SIGNALLED: "This direction already signalled today",
+    OrbReason.FRICTION_TOO_HIGH: "Estimated costs and slippage are too large for this range",
+    OrbReason.FRICTION_UNAVAILABLE: "Trading costs could not be estimated; no trade is taken",
 }
 
 

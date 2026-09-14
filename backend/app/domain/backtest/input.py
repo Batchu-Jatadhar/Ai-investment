@@ -28,7 +28,13 @@ from decimal import Decimal
 from app.core.canonical import canonical_datetime, canonical_decimal
 from app.core.time import to_ist
 from app.domain.backtest.config import CostSchedule, ExecutionConfig, SlippageConfig
-from app.domain.indicators import DEFAULT_ATR_PERIOD, average_true_range
+from app.domain.backtest.costs import estimate_round_trip_friction
+from app.domain.indicators import (
+    DEFAULT_ATR_PERIOD,
+    average_true_range,
+    session_average_true_range,
+    session_bars,
+)
 from app.domain.market.aggregation import aggregate_minutes
 from app.domain.market.models import Candle, CandleInterval, CandleStatus, Instrument
 from app.domain.market.session import MarketSessionCalendar
@@ -54,6 +60,24 @@ PRIOR_ATR_RULES = {
         "period": str(DEFAULT_ATR_PERIOD),
         "source": "complete 15m bars aggregated from 1m bars strictly before the session",
     },
+    "3": {
+        "method": "wilder",
+        "period": str(DEFAULT_ATR_PERIOD),
+        "source": (
+            "session bars from complete 1m coverage of session open to hard_exit_time, "
+            "strictly before the session"
+        ),
+    },
+}
+
+#: ORB v3's two filters, named in v3 fingerprints only.
+V3_RANGE_FILTER_RULE = {
+    "reachability": "opening range width x (1 + target_r_multiple) <= prior session ATR",
+    "friction": (
+        "statutory charges on a buy and a sell leg at fixed_notional_inr and the opening-range "
+        "boundary price, per share, plus 2 x adverse_ticks x tick_size, "
+        "<= max_friction_r x opening range width"
+    ),
 }
 
 
@@ -251,7 +275,7 @@ class BacktestInput:
         Exposed so a failing reproducibility check can be diagnosed by diffing
         two payloads rather than by staring at two different hex digests.
         """
-        return {
+        payload: dict[str, object] = {
             "calendar": _calendar_payload(self.calendar),
             "candles_1m": _series_payload(
                 self.candles_1m, self.strategy_params.resolution_interval
@@ -265,6 +289,9 @@ class BacktestInput:
             "slippage_config": self.slippage_config.canonical(),
             "strategy_params": self.strategy_params.canonical(),
         }
+        if self.strategy_params.hypothesis_version == "3":
+            payload["range_filter"] = V3_RANGE_FILTER_RULE
+        return payload
 
     def fingerprint(self) -> str:
         """Deterministic SHA-256 identity of this input.
@@ -307,6 +334,9 @@ class BacktestInput:
             1-minute resolution bars, the same derivation that stores 15m bars at
             ingestion. A 15-minute slot missing any minute is not a bar and is left
             out, never filled.
+        *   **v3** - one :func:`session_bars` bar per earlier session with complete
+            1-minute coverage from the open to ``hard_exit_time``, Wilder ATR over
+            those. A session missing any minute of that window gets no bar.
 
         The session's own bars - its opening range included - and anything after
         it never contribute, so the value is knowable at the opening bell. The bars
@@ -321,6 +351,12 @@ class BacktestInput:
         Wilder state forward session to session if long runs make it slow.
         """
         params = self.strategy_params
+        if params.hypothesis_version == "3":
+            minutes = tuple(c for c in self.candles_1m if to_ist(c.start_at).date() < session)
+            bars = session_bars(minutes, self.calendar, window_end=params.hard_exit_time)
+            if len(bars) < DEFAULT_ATR_PERIOD + 1:
+                return None
+            return session_average_true_range(bars, DEFAULT_ATR_PERIOD)
         if params.hypothesis_version == "1":
             prior = tuple(c for c in self.candles_5m if to_ist(c.start_at).date() < session)
         else:
@@ -329,3 +365,19 @@ class BacktestInput:
         if len(prior) < DEFAULT_ATR_PERIOD + 1:
             return None
         return average_true_range(prior, DEFAULT_ATR_PERIOD)
+
+    def round_trip_friction(self, price: Decimal) -> Decimal | None:
+        """Estimated round-trip friction per share at ``price`` under this input's costs.
+
+        What ORB v3's friction filter compares against the opening range: this
+        input's cost schedule, fixed notional, lot size, tick size and slippage,
+        applied by :func:`estimate_round_trip_friction`.
+        """
+        return estimate_round_trip_friction(
+            price,
+            schedule=self.cost_schedule,
+            notional=self.strategy_params.fixed_notional_inr,
+            lot_size=self.instrument.lot_size,
+            tick_size=self.instrument.tick_size,
+            adverse_ticks=self.slippage_config.adverse_ticks,
+        )

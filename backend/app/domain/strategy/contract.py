@@ -33,7 +33,7 @@ once it knows what was actually paid.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -144,6 +144,10 @@ class StrategyContext:
     session_open: datetime
     session_close: datetime
     prior_atr: Decimal | None = None
+    #: Estimated round-trip friction per share at a price, or ``None`` when it
+    #: cannot be estimated. Costs, slippage and sizing are published before the
+    #: session, so this carries no future information. Only ORB v3 reads it.
+    round_trip_friction: Callable[[Decimal], Decimal | None] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "session_open", ensure_utc(self.session_open))

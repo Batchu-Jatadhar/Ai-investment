@@ -154,6 +154,42 @@ def test_v2_warmup_needs_fifteen_complete_15m_bars_and_is_refused_deterministica
     assert loaded.backtest_input.prior_atr(FRI) is not None
 
 
+def test_v3_warmup_needs_fifteen_complete_session_bars_and_is_refused_deterministically(
+    repository,  # noqa: ANN001
+) -> None:
+    """14 full warmup sessions leave the first session without a session ATR; 15 give it one."""
+    from app.domain.strategy.params import ORB_V3
+
+    days = [date(2026, 8, d) for d in (3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 24)]
+    for day in days:
+        store(repository, day, 375)
+
+    def load_v3(warmup: date, start: date):  # noqa: ANN202
+        return load_backtest_input(
+            repository,
+            RELIANCE,
+            warmup_start=midnight(warmup),
+            start=midnight(start),
+            end=midnight(date(2026, 8, 25)),
+            strategy_params=ORB_V3,
+            cost_schedule=NSE_INTRADAY_EQUITY,
+            slippage_config=SlippageConfig(),
+            execution_config=ExecutionConfig(),
+            calendar=MarketSessionCalendar.nse_equity(),
+        )
+
+    messages = []
+    for _ in range(2):
+        with pytest.raises(InsufficientWarmupError, match="15 complete session bars") as exc:
+            load_v3(days[0], days[14])
+        messages.append(str(exc.value))
+    assert messages[0] == messages[1] and "holds 14" in messages[0]
+
+    loaded = load_v3(days[0], days[15])
+    assert loaded.warmup_sessions == tuple(days[:15])
+    assert loaded.backtest_input.prior_atr(days[15]) is not None
+
+
 def test_a_long_range_loads_completely_through_pagination(repository) -> None:  # noqa: ANN001
     """14 full sessions: 5,250 minutes and 1,050 five-minute bars, read 1,000 at a time."""
     days = [date(2026, 8, d) for d in (3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 20)]

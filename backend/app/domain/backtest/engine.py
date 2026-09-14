@@ -123,6 +123,7 @@ def run_backtest(
             session_open=bounds[0],
             session_close=bounds[1],
             prior_atr=data.prior_atr(day),
+            round_trip_friction=data.round_trip_friction,
         )
         minutes = sessions_1m.get(day, ())
 
