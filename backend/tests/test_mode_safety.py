@@ -26,6 +26,11 @@ from tests.conftest import build_settings
 #: and executes nothing.
 WEBHOOK_PATH = "/webhooks/tradingview"
 
+#: The Kite Connect interactive login. GET-only authentication routes that mint a
+#: market-data access token; they are the only paths allowed to name the broker,
+#: and they reach no order, trade or execution code.
+ZERODHA_AUTH_PATHS = frozenset({"/auth/zerodha/login", "/auth/zerodha/callback"})
+
 FULL_LIVE_CONFIG = {
     "trading_mode": "live",
     "zerodha_api_key": "k",
@@ -130,7 +135,9 @@ class TestNoExecutionSurface:
     def test_no_trading_routes_are_registered(self, app: FastAPI) -> None:
         paths = self._published_paths(app)
         assert paths, "the API must publish at least one path"
-        offending = sorted(p for p in paths if any(w in p.lower() for w in self.FORBIDDEN))
+        offending = sorted(
+            p for p in paths - ZERODHA_AUTH_PATHS if any(w in p.lower() for w in self.FORBIDDEN)
+        )
         assert offending == [], f"execution-capable routes must not exist: {offending}"
 
     def test_the_alert_webhook_is_the_only_write_endpoint(self, app: FastAPI) -> None:
@@ -149,6 +156,7 @@ class TestNoExecutionSurface:
         assert self._published_paths(app) == {
             WEBHOOK_PATH,
             "/dashboard/paper",
+            *ZERODHA_AUTH_PATHS,
             "/health",
             "/health/db",
             "/health/market-data",

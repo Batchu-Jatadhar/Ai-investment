@@ -1,7 +1,9 @@
 """API composition root.
 
 Health, read-only market-data queries, one inbound alert webhook, and the read-only
-PAPER dashboard (``/dashboard/paper``, the trader UI read side of paper trading).
+PAPER dashboard (``/dashboard/paper``, the trader UI read side of paper trading), and
+the Kite Connect interactive login (``/auth/zerodha/login`` and ``/callback``), which
+mints a market-data access token and places nothing.
 
 There is deliberately NO order-placement route, no broker write route and no
 trading route of any kind. The single endpoint that accepts POST is
@@ -15,10 +17,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api import dashboard, health, market_data, webhooks
+from app.api import dashboard, health, market_data, webhooks, zerodha_auth
 
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(market_data.router)
 api_router.include_router(webhooks.router)
 api_router.include_router(dashboard.router)
+api_router.include_router(zerodha_auth.router)
