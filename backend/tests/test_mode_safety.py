@@ -283,7 +283,7 @@ class TestDomainPurity:
     """
 
     #: Packages that must be pure: no vendor, no persistence, no I/O, no clock.
-    PURE_PACKAGES = ("strategy", "backtest", "execution", "risk")
+    PURE_PACKAGES = ("strategy", "backtest", "execution", "risk", "ai")
 
     #: Single-module members of the same surface. ``indicators`` is a module
     #: rather than a package because it holds two functions, and the rules that

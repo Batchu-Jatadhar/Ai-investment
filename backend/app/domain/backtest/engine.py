@@ -42,7 +42,7 @@ arrive with historical data.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -60,13 +60,19 @@ from app.domain.backtest.models import Fill, RunManifest, SignalRecord
 from app.domain.backtest.portfolio import Portfolio
 from app.domain.backtest.result import BacktestResult
 from app.domain.market.models import Candle
-from app.domain.strategy.contract import Strategy, StrategyContext
+from app.domain.strategy.contract import Signal, Strategy, StrategyContext
 from app.domain.strategy.orb import OrbStrategy
 
-__all__ = ["ENGINE_VERSION", "run_backtest"]
+__all__ = ["ENGINE_VERSION", "SignalGate", "run_backtest"]
 
 #: Recorded in every manifest. Bump when the sequencing changes.
 ENGINE_VERSION = "2.6.3"
+
+#: Decides whether a strategy signal may be traded. Handed the signal, the session
+#: prefix that produced it and the context, it returns that signal's record. It may
+#: only subtract: it cannot create a signal, and one that returns a record for any
+#: other signal, or one already carrying an execution status, raises.
+SignalGate = Callable[[Signal, Sequence[Candle], StrategyContext], SignalRecord]
 
 
 def _by_session(candles: Sequence[Candle]) -> dict[date, tuple[Candle, ...]]:
@@ -81,8 +87,13 @@ def run_backtest(
     starting_capital: Decimal,
     generated_at: datetime,
     strategy: Strategy | None = None,
+    signal_gate: SignalGate | None = None,
 ) -> BacktestResult:
-    """Run ``backtest_input`` session by session, bar by bar, and measure it."""
+    """Run ``backtest_input`` session by session, bar by bar, and measure it.
+
+    Without ``signal_gate`` every signal is accepted by the strategy, which is the
+    strategy-only path. With one, rejected signals are logged and never entered.
+    """
     data = backtest_input
     active: Strategy | OrbStrategy = (
         strategy if strategy is not None else OrbStrategy(data.strategy_params)
@@ -177,13 +188,21 @@ def run_backtest(
                     portfolio = portfolio.close(exit_fill, ambiguity=resolution.ambiguity)
                     held = None
 
-            decided = active.on_bar(bars[: index + 1], context)
+            seen = bars[: index + 1]
+            decided = active.on_bar(seen, context)
             if decided is None:
                 continue
-            signal_log.append(
-                SignalRecord(signal=decided, accepted=True, decision_reason=decided.reason)
-            )
-            if held is None:
+            if signal_gate is None:
+                record = SignalRecord(signal=decided, accepted=True, decision_reason=decided.reason)
+            else:
+                record = signal_gate(decided, seen, context)
+                if record.signal != decided or record.execution_status is not None:
+                    raise ValueError(
+                        "a signal gate may only accept or reject the signal it was handed; it "
+                        "returned a record for a different signal or one already executed"
+                    )
+            signal_log.append(record)
+            if held is None and record.accepted:
                 pending = len(signal_log) - 1  # entered at the next bar's open
 
         if pending is not None:

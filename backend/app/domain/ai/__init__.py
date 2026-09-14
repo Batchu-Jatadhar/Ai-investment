@@ -1,6 +1,7 @@
 """AI trade analyst. Advisory only, subtractive only.
 
-Status: not implemented. Introduced in Phase 8.
+Implemented: ``analyst`` - the verdict contract and its strict parser. No LLM client
+is wired in; the only analyst is a local deterministic fake.
 
 Planned responsibilities:
   * verdict is one of TAKE_TRADE / WAIT / REJECT
