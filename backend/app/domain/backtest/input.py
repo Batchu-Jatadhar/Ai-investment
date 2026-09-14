@@ -147,9 +147,18 @@ def _instrument_payload(instrument: Instrument) -> dict[str, str]:
     }
 
 
-def _calendar_payload(calendar: MarketSessionCalendar) -> dict[str, str]:
+def _calendar_payload(
+    calendar: MarketSessionCalendar, first: date | None, last: date | None
+) -> dict[str, str]:
+    """The calendar as it bears on ``[first, last]``.
+
+    Special sessions are rendered only when one falls inside the input's dates,
+    and the key is omitted otherwise. Declaring a special session therefore
+    changes the fingerprint of exactly the inputs that could trade it, and every
+    other fingerprint stays what it was.
+    """
     window = calendar.window
-    return {
+    rendered = {
         "close_time": window.close_time.isoformat(),
         "holidays": ",".join(day.isoformat() for day in sorted(calendar.holidays)),
         "open_time": window.open_time.isoformat(),
@@ -158,6 +167,14 @@ def _calendar_payload(calendar: MarketSessionCalendar) -> dict[str, str]:
         "weekend_days": ",".join(str(day) for day in sorted(calendar.weekend_days)),
         "window": window.name,
     }
+    inside = sorted(
+        day
+        for day in calendar.special_sessions
+        if first is not None and last is not None and first <= day <= last
+    )
+    if inside:
+        rendered["special_sessions"] = ",".join(day.isoformat() for day in inside)
+    return rendered
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +293,7 @@ class BacktestInput:
         two payloads rather than by staring at two different hex digests.
         """
         payload: dict[str, object] = {
-            "calendar": _calendar_payload(self.calendar),
+            "calendar": _calendar_payload(self.calendar, *self._date_span()),
             "candles_1m": _series_payload(
                 self.candles_1m, self.strategy_params.resolution_interval
             ),
@@ -292,6 +309,10 @@ class BacktestInput:
         if self.strategy_params.hypothesis_version == "3":
             payload["range_filter"] = V3_RANGE_FILTER_RULE
         return payload
+
+    def _date_span(self) -> tuple[date | None, date | None]:
+        days = [to_ist(c.start_at).date() for c in (*self.candles_5m, *self.candles_1m)]
+        return (min(days), max(days)) if days else (None, None)
 
     def fingerprint(self) -> str:
         """Deterministic SHA-256 identity of this input.

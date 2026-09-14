@@ -20,6 +20,7 @@ from app.core.time import IST, ensure_utc, ist_datetime, to_ist
 
 __all__ = [
     "NSE_EQUITY_SESSION",
+    "NSE_EQUITY_SPECIAL_SESSIONS",
     "MarketSessionCalendar",
     "SessionState",
     "SessionWindow",
@@ -65,7 +66,21 @@ NSE_EQUITY_SESSION = SessionWindow(
     close_time=time(15, 30),
     post_close_end=time(16, 0),
 )
-"""Normal NSE equity session, in IST. Special sessions are out of scope here."""
+"""Normal NSE equity session, in IST."""
+
+NSE_EQUITY_SPECIAL_SESSIONS: frozenset[date] = frozenset(
+    {
+        # Sunday. A full 09:15-15:30 equity session held on the Union Budget day;
+        # every stored instrument has a complete 375-minute session for it.
+        date(2026, 2, 1),
+    }
+)
+"""NSE equity trading days that fall on a weekend, declared one by one.
+
+Only dates with evidence of a real session belong here. A day missing from this
+set fails loudly - the engine refuses bars on a day the calendar does not trade -
+so an omission is found rather than silently traded around.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,20 +90,43 @@ class MarketSessionCalendar:
     Holidays are an injected set rather than a built-in calendar: a wrong
     hard-coded holiday list is worse than none, because it silently suppresses
     real trading days. Supply the exchange's published list when it matters.
+
+    ``special_sessions`` are the opposite: exchange-published trading days that
+    fall on a weekend day. Each is declared explicitly, trades the normal
+    ``window``, and nothing else about weekends changes. A date may not be both a
+    holiday and a special session.
     """
 
     window: SessionWindow = NSE_EQUITY_SESSION
     holidays: frozenset[date] = field(default_factory=frozenset)
     weekend_days: frozenset[int] = frozenset({5, 6})  # Sat, Sun in IST
+    special_sessions: frozenset[date] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        both = sorted(self.holidays & self.special_sessions)
+        if both:
+            raise ValueError(
+                f"{both[0].isoformat()} is declared both a holiday and a special session"
+            )
 
     @classmethod
-    def nse_equity(cls, holidays: Iterable[date] = ()) -> MarketSessionCalendar:
-        return cls(window=NSE_EQUITY_SESSION, holidays=frozenset(holidays))
+    def nse_equity(
+        cls,
+        holidays: Iterable[date] = (),
+        special_sessions: Iterable[date] = NSE_EQUITY_SPECIAL_SESSIONS,
+    ) -> MarketSessionCalendar:
+        return cls(
+            window=NSE_EQUITY_SESSION,
+            holidays=frozenset(holidays),
+            special_sessions=frozenset(special_sessions),
+        )
 
     # ------------------------------------------------------------------ #
 
     def is_trading_day(self, day: date) -> bool:
-        return day.weekday() not in self.weekend_days and day not in self.holidays
+        if day in self.holidays:
+            return False
+        return day.weekday() not in self.weekend_days or day in self.special_sessions
 
     def state_at(self, moment: datetime) -> SessionState:
         """Session state at an aware instant."""
