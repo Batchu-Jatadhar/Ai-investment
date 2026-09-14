@@ -1,6 +1,7 @@
 """Trade lifecycle state machine and the trade supervisor.
 
-Status: not implemented. Introduced in Phase 5-6.
+Implemented: ``ports`` - the broker-neutral ExecutionPort and order lifecycle. Its only
+implementation is the paper adapter; live execution does not exist.
 
 Planned responsibilities:
   * explicit trade state machine with a closed transition set

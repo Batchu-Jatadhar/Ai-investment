@@ -93,6 +93,8 @@ class FillReason(StrEnum):
     STOP = "stop"
     TARGET = "target"
     TIME_EXIT = "time_exit"
+    #: An operator-requested exit. Paper execution only; the backtest never emits it.
+    FLATTEN = "flatten"
 
     @property
     def is_exit(self) -> bool:
